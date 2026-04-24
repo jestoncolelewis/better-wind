@@ -1,0 +1,23 @@
+# Boise Air Terminal — second airport to prove the pipeline generalizes.
+icao: KBOI
+name: Boise Air Terminal / Gowen Field
+latitude: 43.5644
+longitude: -116.2228
+elevation_ft: 2871
+timezone: America/Boise
+
+runways:
+  - id: "10R/28L"
+    heading_deg_true: 100
+  - id: "10L/28R"
+    heading_deg_true: 100
+
+# Same Treasure Valley channeling; Nampa and Caldwell sit upwind in NW flow,
+# Mountain Home is the downstream continuation to the SE.
+neighbor_stations:
+  - KMAN   # Nampa,         ~20nm SW, same valley
+  - KEUL   # Caldwell,      ~25nm W
+  - KMUO   # Mountain Home, ~35nm SE
+  - KONO   # Ontario OR,    ~55nm NW
+
+history_start: "2015-01-01"
