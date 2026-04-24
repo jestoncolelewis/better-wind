@@ -1,0 +1,22 @@
+# Nampa Municipal Airport — primary development target.
+icao: KMAN
+name: Nampa Municipal Airport
+latitude: 43.5817
+longitude: -116.5225
+elevation_ft: 2537
+timezone: America/Boise
+
+runways:
+  - id: "11/29"
+    heading_deg_true: 110   # true heading of the 11 end
+
+# Nearby ASOS/AWOS stations used as upstream/neighbor features.
+# The Treasure Valley channels NW/SE through Boise and Caldwell; Mountain Home
+# sits in the next valley segment to the SE, Ontario anchors the NW end.
+neighbor_stations:
+  - KBOI   # Boise,         ~20nm NE, same valley
+  - KEUL   # Caldwell,      ~10nm W,  same valley
+  - KMUO   # Mountain Home, ~45nm SE
+  - KONO   # Ontario OR,    ~45nm NW
+
+history_start: "2015-01-01"
