@@ -101,8 +101,11 @@ Re-runs are safe — existing cycle files are skipped. Pass
 
 ```bash
 find data/raw -type f | head
-python3 -c "import pandas as pd; print(pd.read_parquet('data/raw/metar/KMAN/KMAN.parquet').head())"
+uv run python -c "import pandas as pd; print(pd.read_parquet('data/raw/metar/KMAN/KMAN.parquet').head())"
 ```
+
+`uv run python` uses the project venv where pandas/pyarrow are installed —
+plain `python3` from your shell won't have them.
 
 You should see the canonical METAR schema:
 `station, valid_utc, drct, sknt, gust, u, v, tmpf, dwpf, alti, mslp, vsby, metar`.
