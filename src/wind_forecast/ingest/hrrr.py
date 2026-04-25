@@ -148,10 +148,14 @@ def fetch_cycle(
 
     if cycle.tzinfo is None:
         cycle = cycle.replace(tzinfo=timezone.utc)
+    # Herbie compares its internal date against a tz-naive pd.Timestamp.utcnow()
+    # in core.py::_validate, so it rejects tz-aware inputs. Pass a naive UTC
+    # datetime; we keep the tz-aware `cycle` for our own output rows.
+    cycle_naive_utc = cycle.astimezone(timezone.utc).replace(tzinfo=None)
 
     per_lead: list[pd.DataFrame] = []
     for lead in lead_hours:
-        H = Herbie(cycle, model="hrrr", product="sfc", fxx=lead)
+        H = Herbie(cycle_naive_utc, model="hrrr", product="sfc", fxx=lead)
         per_var_rows: dict[tuple[int, int, int], dict[str, Any]] = {}
         for spec in variables:
             try:
