@@ -1,8 +1,9 @@
 """Command-line entry points.
 
-Phase 1 surfaces `ingest-metar` and `ingest-hrrr` only. Later phases wire up
-`build-features`, `train`, `eval`, and `predict` using the same `--airport`
-convention.
+Phase 1 surfaces `ingest-metar` and `ingest-hrrr`. Phase 2 adds `eval`, which
+runs the deterministic baselines (persistence, raw HRRR, climatological bias
+correction) for one airport. Later phases wire up `build-features`, `train`,
+and `predict` using the same `--airport` convention.
 """
 
 from __future__ import annotations
@@ -74,7 +75,7 @@ data_root_option = click.option(
 )
 @click.pass_context
 def cli(ctx: click.Context, verbose: int, log_file: Path | None) -> None:
-    """Site-specific wind forecasting — phase 1 data pipeline."""
+    """Site-specific wind forecasting — data pipeline + baseline evaluation."""
     log_path = setup_logging(verbose=verbose, log_file=log_file)
     click.echo(f"logging to {log_path}", err=True)
     ctx.ensure_object(dict)
@@ -188,6 +189,56 @@ def ingest_hrrr_cmd(
         max_workers=workers,
     )
     click.echo(f"{len(paths)} cycles")
+
+
+@cli.command("eval")
+@airport_option
+@click.option(
+    "--baseline",
+    "baseline_choice",
+    type=click.Choice(["persistence", "hrrr", "climatology", "all"]),
+    default="all",
+    show_default=True,
+    help="Which baseline to score. `all` runs every baseline.",
+)
+@click.option(
+    "--by-lead",
+    is_flag=True,
+    help="Print one row per forecast hour instead of the overall summary.",
+)
+@click.option(
+    "--train-frac", type=float, default=0.70, show_default=True,
+    help="Fraction of unique cycles used for training.",
+)
+@click.option(
+    "--val-frac", type=float, default=0.15, show_default=True,
+    help="Fraction of unique cycles used for validation. Test = remainder.",
+)
+@config_dir_option
+@data_root_option
+def eval_cmd(
+    airport_icao: str,
+    baseline_choice: str,
+    by_lead: bool,
+    train_frac: float,
+    val_frac: float,
+    config_dir: Path,
+    data_root: Path,
+) -> None:
+    """Score deterministic baselines (persistence / HRRR / climatology) on the test split."""
+    from wind_forecast.eval import baselines as bl  # deferred
+    from wind_forecast.eval.harness import evaluate_airport, format_table
+
+    airport = Airport.load(airport_icao, config_dir)
+    names = bl.ALL_BASELINES if baseline_choice == "all" else (baseline_choice,)
+    metrics = evaluate_airport(
+        airport,
+        data_root=data_root,
+        baselines=names,
+        train_frac=train_frac,
+        val_frac=val_frac,
+    )
+    click.echo(format_table(metrics, by_lead=by_lead))
 
 
 if __name__ == "__main__":
