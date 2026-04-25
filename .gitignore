@@ -31,6 +31,9 @@ htmlcov/
 # Project data (per-airport, regenerable)
 data/
 
+# Run logs (per-invocation)
+logs/
+
 # Editor / OS
 .idea/
 .vscode/

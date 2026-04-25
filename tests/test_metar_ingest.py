@@ -6,9 +6,11 @@ across stations/airports is part of the Phase 1 acceptance criterion.
 
 from __future__ import annotations
 
+from datetime import date
+
 import numpy as np
 
-from wind_forecast.ingest.metar import OUTPUT_COLUMNS, parse_csv
+from wind_forecast.ingest.metar import OUTPUT_COLUMNS, date_chunks, parse_csv
 
 CSV_HEADER = "station,valid,drct,sknt,gust,tmpf,dwpf,alti,mslp,vsby,metar"
 
@@ -78,3 +80,26 @@ def test_schema_identical_across_stations() -> None:
     kboi = parse_csv(_csv("KBOI,2024-01-01 00:00,180,15,20,45.0,30.0,30.10,1020.0,10.0,"))
     assert list(kman.columns) == list(kboi.columns)
     assert kman.dtypes.equals(kboi.dtypes)
+
+
+def test_date_chunks_tiles_full_range_without_overlap() -> None:
+    chunks = date_chunks(date(2020, 1, 1), date(2022, 12, 31), chunk_days=366)
+    # Every chunk must be within bounds, contiguous (next start = prev end + 1),
+    # and at most chunk_days long.
+    assert chunks[0][0] == date(2020, 1, 1)
+    assert chunks[-1][1] == date(2022, 12, 31)
+    for (s, e) in chunks:
+        assert (e - s).days < 366
+        assert s <= e
+    for prev, nxt in zip(chunks[:-1], chunks[1:], strict=True):
+        assert (nxt[0] - prev[1]).days == 1
+
+
+def test_date_chunks_single_chunk_when_range_fits() -> None:
+    assert date_chunks(date(2024, 1, 1), date(2024, 1, 31), chunk_days=366) == [
+        (date(2024, 1, 1), date(2024, 1, 31)),
+    ]
+
+
+def test_date_chunks_empty_when_end_before_start() -> None:
+    assert date_chunks(date(2024, 6, 1), date(2024, 5, 1)) == []
