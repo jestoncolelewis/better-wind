@@ -172,6 +172,6 @@ All three must pass before commits.
 ## What's next
 
 Phase 2 (baselines) and Phase 3 (LightGBM residual model) are not yet
-implemented. See [CLAUD.md](CLAUD.md) for the full roadmap — the target for
+implemented. See [CLAUDE.md](CLAUDE.md) for the full roadmap — the target for
 Phase 3 is to beat raw HRRR by ≥15% RMSE on scalar wind speed at forecast
 hour 6 for KMAN.
