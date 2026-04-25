@@ -63,17 +63,22 @@ have to activate the venv manually.
 
 ## Pull data for the primary airport (KMAN)
 
-METAR observations (ground truth, fast — one CSV per station):
+METAR observations (ground truth):
 
 ```bash
 uv run wind-forecast ingest-metar --airport KMAN
 ```
 
-This hits the Iowa Mesonet ASOS endpoint once per station (`KMAN` plus every
-entry in the airport's `neighbor_stations`) and writes one Parquet file per
-station to `data/raw/metar/KMAN/`. The date range defaults to
-`history_start` from the YAML through "today UTC"; override with
+This hits the Iowa Mesonet ASOS endpoint for every station (`KMAN` plus every
+entry in `neighbor_stations`), splits each station's date range into yearly
+chunks, fetches all `(station, chunk)` pairs in parallel, and writes one
+Parquet file per station to `data/raw/metar/KMAN/`. The date range defaults
+to `history_start` through "today UTC"; override with
 `--start YYYY-MM-DD --end YYYY-MM-DD`.
+
+Tuning knobs (defaults in parens): `--workers N` (4) parallel requests,
+`--chunk-days N` (366) days per request, `--no-skip-existing` to force a
+re-fetch of stations that already have a Parquet on disk.
 
 HRRR forecasts (predictors + baseline, **slow** — one GRIB fetch per cycle ×
 lead × variable):

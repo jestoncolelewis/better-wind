@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import io
 import logging
+import threading
 import time
 from collections.abc import Iterable
-from datetime import date, datetime, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
@@ -63,6 +65,23 @@ OUTPUT_DTYPES: dict[str, str] = {
 OUTPUT_COLUMNS: tuple[str, ...] = tuple(OUTPUT_DTYPES.keys())
 
 DEFAULT_HISTORY_START = date(2015, 1, 1)
+DEFAULT_CHUNK_DAYS = 366
+DEFAULT_WORKERS = 4
+
+_thread_local = threading.local()
+
+
+def _thread_session() -> requests.Session:
+    """One requests.Session per worker thread.
+
+    Sharing a single Session across many concurrent threads has connection-pool
+    contention; per-thread sessions keep keep-alive and pool ownership clean.
+    """
+    sess = getattr(_thread_local, "session", None)
+    if sess is None:
+        sess = requests.Session()
+        _thread_local.session = sess
+    return sess
 
 
 def _build_query(
@@ -190,22 +209,42 @@ def parse_csv(text: str, station_override: str | None = None) -> pd.DataFrame:
     return out
 
 
-def ingest_station(
-    station: str,
-    out_path: Path,
-    *,
-    start: date,
-    end: date,
-    session: requests.Session | None = None,
-) -> pd.DataFrame:
-    """Fetch one station, write Parquet, return the frame."""
-    logger.info("Fetching METAR for %s  [%s..%s]", station, start, end)
-    csv_text = _fetch_station_csv(station, start, end, session=session)
-    df = parse_csv(csv_text, station_override=station)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(out_path, index=False)
-    logger.info("Wrote %d rows to %s", len(df), out_path)
-    return df
+def date_chunks(start: date, end: date, chunk_days: int = DEFAULT_CHUNK_DAYS) -> list[tuple[date, date]]:
+    """Tile `[start, end]` into inclusive chunks of at most `chunk_days` days.
+
+    Mesonet handles many small requests far better than one huge one — its
+    backend appears to scale poorly with the year range. Each chunk hits a
+    fast path on their server.
+    """
+    if chunk_days < 1:
+        raise ValueError("chunk_days must be >= 1")
+    if end < start:
+        return []
+    chunks: list[tuple[date, date]] = []
+    cur = start
+    span = timedelta(days=chunk_days - 1)
+    while cur <= end:
+        nxt = min(cur + span, end)
+        chunks.append((cur, nxt))
+        cur = nxt + timedelta(days=1)
+    return chunks
+
+
+def _fetch_chunk(station: str, start: date, end: date) -> pd.DataFrame:
+    """Worker task: fetch one (station, chunk) pair and parse it."""
+    text = _fetch_station_csv(station, start, end, session=_thread_session())
+    return parse_csv(text, station_override=station)
+
+
+def _finalize(frames: list[pd.DataFrame]) -> pd.DataFrame:
+    if not frames:
+        return _empty_frame()
+    df = pd.concat(frames, ignore_index=True)
+    return (
+        df.drop_duplicates(subset=["station", "valid_utc"], keep="last")
+          .sort_values("valid_utc")
+          .reset_index(drop=True)
+    )
 
 
 def ingest_airport(
@@ -214,23 +253,106 @@ def ingest_airport(
     start: date | None = None,
     end: date | None = None,
     data_root: Path = DEFAULT_DATA_ROOT,
-    session: requests.Session | None = None,
+    chunk_days: int = DEFAULT_CHUNK_DAYS,
+    max_workers: int = DEFAULT_WORKERS,
+    skip_existing: bool = True,
 ) -> dict[str, Path]:
     """Ingest the target airport and every neighbor station.
 
-    Returns a mapping of station ICAO to the Parquet path that was written.
+    Each station's date range is split into ~yearly chunks, and all
+    (station, chunk) pairs run in a shared `ThreadPoolExecutor`. Existing
+    Parquet files are skipped unless `skip_existing=False`.
     """
     resolved_start = start or airport.history_start or DEFAULT_HISTORY_START
     resolved_end = end or datetime.now(tz=timezone.utc).date()
     out_dir = airport.raw_metar_dir(data_root)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    sess = session or requests.Session()
+    stations = airport.all_stations()
+    paths: dict[str, Path] = {s: out_dir / f"{s}.parquet" for s in stations}
+
+    tasks: list[tuple[str, date, date]] = []
+    skipped: list[str] = []
+    for station in stations:
+        path = paths[station]
+        if skip_existing and path.exists() and path.stat().st_size > 0:
+            skipped.append(station)
+            continue
+        for s, e in date_chunks(resolved_start, resolved_end, chunk_days):
+            tasks.append((station, s, e))
+
+    if skipped:
+        logger.info("METAR skip-existing: %s", ", ".join(skipped))
+
+    if not tasks:
+        return {s: paths[s] for s in stations if paths[s].exists()}
+
+    workers = max(1, min(max_workers, len(tasks)))
+    logger.info(
+        "METAR ingest: airport=%s stations=%d tasks=%d workers=%d chunk_days=%d",
+        airport.icao, len(stations) - len(skipped), len(tasks), workers, chunk_days,
+    )
+
+    chunks_by_station: dict[str, list[pd.DataFrame]] = {s: [] for s in stations}
+    completed = 0
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        future_map = {
+            pool.submit(_fetch_chunk, station, s, e): (station, s, e)
+            for station, s, e in tasks
+        }
+        for fut in as_completed(future_map):
+            station, s, e = future_map[fut]
+            try:
+                df = fut.result()
+            except Exception as exc:
+                logger.warning(
+                    "chunk failed station=%s [%s..%s]: %s", station, s, e, exc,
+                )
+                continue
+            chunks_by_station[station].append(df)
+            completed += 1
+            logger.info(
+                "[%d/%d] %s %s..%s -> %d rows",
+                completed, len(tasks), station, s, e, len(df),
+            )
+
     written: dict[str, Path] = {}
-    for station in airport.all_stations():
-        path = out_dir / f"{station}.parquet"
-        ingest_station(
-            station, path, start=resolved_start, end=resolved_end, session=sess
-        )
+    for station, frames in chunks_by_station.items():
+        path = paths[station]
+        if not frames:
+            if path.exists():
+                written[station] = path
+            continue
+        df = _finalize(frames)
+        df.to_parquet(path, index=False)
+        logger.info("wrote %d rows to %s", len(df), path)
         written[station] = path
     return written
+
+
+def ingest_station(
+    station: str,
+    out_path: Path,
+    *,
+    start: date,
+    end: date,
+    chunk_days: int = DEFAULT_CHUNK_DAYS,
+    max_workers: int = DEFAULT_WORKERS,
+) -> pd.DataFrame:
+    """Fetch one station (chunked + parallel) and write a Parquet."""
+    chunks = date_chunks(start, end, chunk_days)
+    workers = max(1, min(max_workers, len(chunks)))
+    frames: list[pd.DataFrame] = []
+    if workers == 1:
+        for s, e in chunks:
+            frames.append(_fetch_chunk(station, s, e))
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(_fetch_chunk, station, s, e) for s, e in chunks]
+            for fut in as_completed(futures):
+                frames.append(fut.result())
+    df = _finalize(frames)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(out_path, index=False)
+    logger.info("Wrote %d rows to %s", len(df), out_path)
+    return df

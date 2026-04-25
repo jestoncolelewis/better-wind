@@ -92,12 +92,24 @@ def list_airports(config_dir: Path) -> None:
 @airport_option
 @click.option("--start", callback=_parse_date, help="YYYY-MM-DD, default: airport.history_start.")
 @click.option("--end", callback=_parse_date, help="YYYY-MM-DD, default: today UTC.")
+@click.option(
+    "--workers", type=int, default=4, show_default=True,
+    help="Parallel (station, chunk) fetches.",
+)
+@click.option(
+    "--chunk-days", type=int, default=366, show_default=True,
+    help="Split each station's range into chunks at most this many days long.",
+)
+@click.option("--no-skip-existing", is_flag=True, help="Re-fetch stations already on disk.")
 @config_dir_option
 @data_root_option
 def ingest_metar_cmd(
     airport_icao: str,
     start: date | None,
     end: date | None,
+    workers: int,
+    chunk_days: int,
+    no_skip_existing: bool,
     config_dir: Path,
     data_root: Path,
 ) -> None:
@@ -106,7 +118,13 @@ def ingest_metar_cmd(
 
     airport = Airport.load(airport_icao, config_dir)
     written = metar_ingest.ingest_airport(
-        airport, start=start, end=end, data_root=data_root
+        airport,
+        start=start,
+        end=end,
+        data_root=data_root,
+        max_workers=workers,
+        chunk_days=chunk_days,
+        skip_existing=not no_skip_existing,
     )
     for station, path in written.items():
         click.echo(f"{station}: {path}")
