@@ -65,6 +65,14 @@ def test_schema_stable_with_empty_input() -> None:
     assert len(df) == 0
 
 
+def test_station_override_normalizes_faa_to_icao() -> None:
+    # Mesonet returns 3-letter FAA codes (e.g. "MAN") even when we query KMAN.
+    # The override forces the partition key back to the requested ICAO.
+    text = _csv("MAN,2024-01-01 00:00,360,10,,30.0,20.0,30.10,1020.0,10.0,KMAN 010000Z 36010KT")
+    df = parse_csv(text, station_override="KMAN")
+    assert (df["station"] == "KMAN").all()
+
+
 def test_schema_identical_across_stations() -> None:
     kman = parse_csv(_csv("KMAN,2024-01-01 00:00,360,10,,30.0,20.0,30.10,1020.0,10.0,"))
     kboi = parse_csv(_csv("KBOI,2024-01-01 00:00,180,15,20,45.0,30.0,30.10,1020.0,10.0,"))

@@ -137,8 +137,15 @@ def _coerce_schema(df: pd.DataFrame) -> pd.DataFrame:
     return df[list(OUTPUT_COLUMNS)]
 
 
-def parse_csv(text: str) -> pd.DataFrame:
-    """Parse the Mesonet CSV into the canonical OUTPUT_COLUMNS schema."""
+def parse_csv(text: str, station_override: str | None = None) -> pd.DataFrame:
+    """Parse the Mesonet CSV into the canonical OUTPUT_COLUMNS schema.
+
+    `station_override` forces the `station` column to a fixed value before
+    dedup. Iowa Mesonet returns 3-letter FAA codes for US stations
+    (e.g. `MAN` for KMAN) even when you query with the 4-letter ICAO, so the
+    caller always passes the ICAO it requested to keep the partition key
+    consistent with `Airport.icao`.
+    """
     df = pd.read_csv(
         io.StringIO(text),
         na_values=["M", "", " "],
@@ -175,6 +182,9 @@ def parse_csv(text: str) -> pd.DataFrame:
     if "metar" not in df.columns:
         df["metar"] = pd.NA
 
+    if station_override is not None:
+        df["station"] = station_override
+
     out = _coerce_schema(df).sort_values("valid_utc").reset_index(drop=True)
     out = out.drop_duplicates(subset=["station", "valid_utc"], keep="last").reset_index(drop=True)
     return out
@@ -191,7 +201,7 @@ def ingest_station(
     """Fetch one station, write Parquet, return the frame."""
     logger.info("Fetching METAR for %s  [%s..%s]", station, start, end)
     csv_text = _fetch_station_csv(station, start, end, session=session)
-    df = parse_csv(csv_text)
+    df = parse_csv(csv_text, station_override=station)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(out_path, index=False)
     logger.info("Wrote %d rows to %s", len(df), out_path)
