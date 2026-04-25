@@ -292,6 +292,9 @@ def ingest_airport(
     if isinstance(end, date) and not isinstance(end, datetime):
         end = datetime(end.year, end.month, end.day, tzinfo=timezone.utc)
 
+    from tqdm.auto import tqdm
+    from tqdm.contrib.logging import logging_redirect_tqdm
+
     cycles = list(iter_cycles(start, end, cycle_step_hours))
     total = len(cycles)
     logger.info(
@@ -300,31 +303,33 @@ def ingest_airport(
     )
 
     written: list[Path] = []
-    for idx, cycle in enumerate(cycles, start=1):
-        path = cycle_path(cycle, airport, data_root)
-        if skip_existing and path.exists():
-            logger.info("[%d/%d] skip existing %s", idx, total, path.name)
+    bar = tqdm(total=total, desc=f"HRRR {airport.icao}", unit="cycle", dynamic_ncols=True)
+    with logging_redirect_tqdm(), bar:
+        for cycle in cycles:
+            path = cycle_path(cycle, airport, data_root)
+            if skip_existing and path.exists():
+                logger.debug("skip existing %s", path.name)
+                written.append(path)
+                bar.update(1)
+                continue
+            t0 = datetime.now(tz=timezone.utc)
+            logger.info("cycle %s", cycle.isoformat())
+            df = fetch_cycle(
+                cycle,
+                airport=airport,
+                lead_hours=lead_hours,
+                variables=variables,
+                grid_half=grid_half,
+                max_workers=max_workers,
+            )
+            elapsed = (datetime.now(tz=timezone.utc) - t0).total_seconds()
+            if df.empty:
+                logger.warning("no data for cycle %s", cycle.isoformat())
+                bar.update(1)
+                continue
+            path.parent.mkdir(parents=True, exist_ok=True)
+            df.to_parquet(path, index=False)
+            logger.info("wrote %d rows to %s in %.1fs", len(df), path.name, elapsed)
             written.append(path)
-            continue
-        t0 = datetime.now(tz=timezone.utc)
-        logger.info("[%d/%d] cycle %s", idx, total, cycle.isoformat())
-        df = fetch_cycle(
-            cycle,
-            airport=airport,
-            lead_hours=lead_hours,
-            variables=variables,
-            grid_half=grid_half,
-            max_workers=max_workers,
-        )
-        elapsed = (datetime.now(tz=timezone.utc) - t0).total_seconds()
-        if df.empty:
-            logger.warning("[%d/%d] no data for cycle %s", idx, total, cycle.isoformat())
-            continue
-        path.parent.mkdir(parents=True, exist_ok=True)
-        df.to_parquet(path, index=False)
-        logger.info(
-            "[%d/%d] wrote %d rows to %s in %.1fs",
-            idx, total, len(df), path.name, elapsed,
-        )
-        written.append(path)
+            bar.update(1)
     return written

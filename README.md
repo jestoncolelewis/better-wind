@@ -80,6 +80,11 @@ Tuning knobs (defaults in parens): `--workers N` (4) parallel requests,
 `--chunk-days N` (366) days per request, `--no-skip-existing` to force a
 re-fetch of stations that already have a Parquet on disk.
 
+The console only shows a progress bar plus warnings/errors. A full DEBUG log
+of the run is written to `logs/wind-forecast-<timestamp>Z.log`. Bump console
+verbosity with `-v` (INFO) or `-vv` (DEBUG), or pin the file with
+`--log-file path/to/run.log`.
+
 HRRR forecasts (predictors + baseline, **slow** — one GRIB fetch per cycle ×
 lead × variable):
 

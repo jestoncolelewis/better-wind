@@ -293,9 +293,12 @@ def ingest_airport(
         airport.icao, len(stations) - len(skipped), len(tasks), workers, chunk_days,
     )
 
+    from tqdm.auto import tqdm
+    from tqdm.contrib.logging import logging_redirect_tqdm
+
     chunks_by_station: dict[str, list[pd.DataFrame]] = {s: [] for s in stations}
-    completed = 0
-    with ThreadPoolExecutor(max_workers=workers) as pool:
+    bar = tqdm(total=len(tasks), desc=f"METAR {airport.icao}", unit="chunk", dynamic_ncols=True)
+    with logging_redirect_tqdm(), bar, ThreadPoolExecutor(max_workers=workers) as pool:
         future_map = {
             pool.submit(_fetch_chunk, station, s, e): (station, s, e)
             for station, s, e in tasks
@@ -308,13 +311,11 @@ def ingest_airport(
                 logger.warning(
                     "chunk failed station=%s [%s..%s]: %s", station, s, e, exc,
                 )
+                bar.update(1)
                 continue
             chunks_by_station[station].append(df)
-            completed += 1
-            logger.info(
-                "[%d/%d] %s %s..%s -> %d rows",
-                completed, len(tasks), station, s, e, len(df),
-            )
+            logger.info("%s %s..%s -> %d rows", station, s, e, len(df))
+            bar.update(1)
 
     written: dict[str, Path] = {}
     for station, frames in chunks_by_station.items():

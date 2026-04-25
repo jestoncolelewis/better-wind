@@ -14,15 +14,9 @@ from pathlib import Path
 import click
 
 from wind_forecast.config import DEFAULT_CONFIG_DIR, DEFAULT_DATA_ROOT, Airport
+from wind_forecast.logging_setup import setup_logging
 
 log = logging.getLogger("wind_forecast")
-
-
-def _setup_logging(verbose: bool) -> None:
-    logging.basicConfig(
-        level=logging.DEBUG if verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
 
 
 def _parse_date(ctx: click.Context, param: click.Parameter, value: str | None) -> date | None:
@@ -68,11 +62,21 @@ data_root_option = click.option(
 
 
 @click.group()
-@click.option("-v", "--verbose", is_flag=True, help="Enable DEBUG logging.")
+@click.option(
+    "-v", "--verbose", count=True,
+    help="Console verbosity: -v = INFO, -vv = DEBUG. Default WARNING.",
+)
+@click.option(
+    "--log-file",
+    type=click.Path(path_type=Path, dir_okay=False),
+    default=None,
+    help="Write the full DEBUG log to this file (default: logs/wind-forecast-{timestamp}Z.log).",
+)
 @click.pass_context
-def cli(ctx: click.Context, verbose: bool) -> None:
+def cli(ctx: click.Context, verbose: int, log_file: Path | None) -> None:
     """Site-specific wind forecasting — phase 1 data pipeline."""
-    _setup_logging(verbose)
+    log_path = setup_logging(verbose=verbose, log_file=log_file)
+    click.echo(f"logging to {log_path}", err=True)
     ctx.ensure_object(dict)
 
 
