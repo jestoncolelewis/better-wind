@@ -43,13 +43,15 @@ have to activate the venv manually.
    ```
    Expected output:
    ```
+   logging to logs/wind-forecast-20260425T210000Z.log
    KBOI  Boise Air Terminal / Gowen Field  (43.5644, -116.2228)
    KMAN  Nampa Municipal Airport  (43.5817, -116.5225)
    ```
 
-2. **Run the test suite.** 25 tests; should pass in under a second. Covers
+2. **Run the test suite.** 32 tests; should pass in under a second. Covers
    config validation, METAR schema stability across stations, wind u/v
-   round-trips, cycle iteration, and path partitioning.
+   round-trips, cycle iteration, path partitioning, date chunking, and
+   logging setup.
    ```bash
    uv run pytest
    ```
@@ -61,9 +63,7 @@ have to activate the venv manually.
    uv run wind-forecast ingest-hrrr  --help
    ```
 
-## Pull data for the primary airport (KMAN)
-
-METAR observations (ground truth):
+## Pull METAR observations (ground truth)
 
 ```bash
 uv run wind-forecast ingest-metar --airport KMAN
@@ -73,20 +73,21 @@ This hits the Iowa Mesonet ASOS endpoint for every station (`KMAN` plus every
 entry in `neighbor_stations`), splits each station's date range into yearly
 chunks, fetches all `(station, chunk)` pairs in parallel, and writes one
 Parquet file per station to `data/raw/metar/KMAN/`. The date range defaults
-to `history_start` through "today UTC"; override with
+to `history_start` from the YAML through "today UTC"; override with
 `--start YYYY-MM-DD --end YYYY-MM-DD`.
 
-Tuning knobs (defaults in parens): `--workers N` (4) parallel requests,
-`--chunk-days N` (366) days per request, `--no-skip-existing` to force a
-re-fetch of stations that already have a Parquet on disk.
+Tuning knobs (defaults in parens):
 
-The console only shows a progress bar plus warnings/errors. A full DEBUG log
-of the run is written to `logs/wind-forecast-<timestamp>Z.log`. Bump console
-verbosity with `-v` (INFO) or `-vv` (DEBUG), or pin the file with
-`--log-file path/to/run.log`.
+| Flag | Default | What it does |
+|---|---|---|
+| `--workers N` | 4 | Parallel `(station, chunk)` requests |
+| `--chunk-days N` | 366 | Days per request — Mesonet handles many small requests far better than one giant one |
+| `--no-skip-existing` | off | Force re-fetch of stations that already have a Parquet on disk |
 
-HRRR forecasts (predictors + baseline, **slow** — one GRIB fetch per cycle ×
-lead × variable):
+If Mesonet rate-limits you (HTTP 429), drop `--workers` to 2. If a single
+chunk keeps timing out, shrink it: `--chunk-days 180`.
+
+## Pull HRRR forecasts (predictors + baseline)
 
 ```bash
 uv run wind-forecast ingest-hrrr \
@@ -96,31 +97,73 @@ uv run wind-forecast ingest-hrrr \
 ```
 
 This iterates every hourly init cycle in `[start, end)`, pulls forecast hours
-`+1..+18` for each cycle, extracts a 5×5 grid box around the airport for every
-required HRRR variable (`10m u/v`, gust, 925/850mb u/v/T, 2m T/Td, psfc, mslp,
-PBLH, CAPE, CIN), and writes one Parquet per cycle to
+`+1..+18` for each cycle (in parallel), extracts a 5×5 grid box around the
+airport for every required HRRR variable (`10m u/v`, gust, 925/850mb u/v/T,
+2m T/Td, psfc, mslp, PBLH, CAPE, CIN), and writes one Parquet per cycle to
 `data/raw/hrrr/KMAN/YYYY/YYYYMMDD_HHZ.parquet`.
 
-> Start with a **short window first** (e.g. one week) to confirm your
-> bandwidth and disk can keep up. The full spec targets years of history.
+Tuning knobs:
 
-Re-runs are safe — existing cycle files are skipped. Pass
-`--no-skip-existing` to force re-download.
+| Flag | Default | What it does |
+|---|---|---|
+| `--workers N` | 8 | Parallel lead-hour fetches per cycle |
+| `--lead-min` / `--lead-max` | 1 / 18 | Forecast-hour range to pull |
+| `--step-hours N` | 1 | Skip cycles (e.g. 3 = every 3rd init) |
+| `--grid-half N` | 2 | `(2N+1) × (2N+1)` box around the airport |
+| `--no-skip-existing` | off | Re-fetch cycles already on disk |
 
-## Verifying the data landed
+> Start with a **short window first** (e.g. one day) to confirm your bandwidth
+> and disk can keep up. The full spec targets years of history. Re-runs skip
+> cycles already on disk, so it's safe to interrupt and resume.
+
+## Logging & progress
+
+Every CLI invocation:
+
+- Prints **only a progress bar plus warnings/errors** to the console. Per-task
+  detail (chunk row counts, retry attempts, cycle timings) goes to a file.
+- Writes a **full DEBUG log** to `logs/wind-forecast-<UTCtimestamp>Z.log`.
+  This is the source of truth when something goes wrong — open it in another
+  terminal with `tail -f logs/wind-forecast-*.log`.
+
+Common controls (all on the top-level command, before the subcommand):
+
+```bash
+uv run wind-forecast -v   ingest-metar --airport KMAN          # console: INFO
+uv run wind-forecast -vv  ingest-hrrr  --airport KMAN ...      # console: DEBUG
+uv run wind-forecast --log-file run.log ingest-metar --airport KMAN
+```
+
+The `logs/` directory is gitignored.
+
+## Inspect what landed
 
 ```bash
 find data/raw -type f | head
 uv run python -c "import pandas as pd; print(pd.read_parquet('data/raw/metar/KMAN/KMAN.parquet').head())"
+uv run python -c "import pandas as pd; print(pd.read_parquet('data/raw/hrrr/KMAN/2024/20240101_00Z.parquet').head())"
 ```
 
 `uv run python` uses the project venv where pandas/pyarrow are installed —
 plain `python3` from your shell won't have them.
 
-You should see the canonical METAR schema:
-`station, valid_utc, drct, sknt, gust, u, v, tmpf, dwpf, alti, mslp, vsby, metar`.
-Every station under every airport produces the same columns and dtypes — this
-is the Phase 1 acceptance criterion.
+Canonical METAR schema (every station, every airport — this is the Phase 1
+acceptance criterion):
+
+```
+station, valid_utc, drct, sknt, gust, u, v, tmpf, dwpf, alti, mslp, vsby, metar
+```
+
+Canonical HRRR schema:
+
+```
+cycle_utc, lead_hour, valid_utc, iy, ix, latitude, longitude,
+u10, v10, gust, u925, v925, t925, u850, v850, t850,
+t2m, d2m, psfc, mslp, pblh, cape, cin
+```
+
+The 5×5 grid box gives 25 rows per `(cycle, lead)`. The airport's nearest
+grid point is `iy == ix == 2`.
 
 ## Adding a new airport
 
@@ -159,17 +202,19 @@ better-wind/
 ├── src/wind_forecast/
 │   ├── config.py               # Airport pydantic model + loader
 │   ├── winds.py                # (u, v) <-> (direction-from, speed)
+│   ├── logging_setup.py        # console + file logging, used by every CLI command
 │   ├── cli.py                  # `wind-forecast` click entry points
 │   └── ingest/
-│       ├── metar.py            # Iowa Mesonet bulk downloader
-│       └── hrrr.py             # herbie wrapper, 5x5 grid extraction
-├── data/                       # gitignored; all outputs land here
+│       ├── metar.py            # Iowa Mesonet bulk downloader (chunked + parallel)
+│       └── hrrr.py             # herbie wrapper, 5×5 grid extraction (parallel leads)
+├── data/                       # gitignored; all data outputs land here
 │   └── raw/
 │       ├── metar/{ICAO}/{STATION}.parquet
 │       └── hrrr/{ICAO}/{YYYY}/{YYYYMMDD_HHZ}.parquet
+├── logs/                       # gitignored; one log file per CLI invocation
 ├── notebooks/
 │   └── 01_data_eda.ipynb       # wind rose, diurnal cycle, HRRR bias stub
-└── tests/                      # config, schema stability, wind conversions
+└── tests/                      # 32 tests covering config, schema, winds, chunks, logging
 ```
 
 ## Developer loop
