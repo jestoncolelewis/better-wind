@@ -4,7 +4,7 @@ Site-specific probabilistic wind forecasting for small airports. One codebase,
 per-airport YAML configs, per-airport trained models. Learns the residual bias
 of HRRR/TAF wind guidance instead of predicting raw wind.
 
-See [CLAUD.md](CLAUD.md) for the full spec and phased build plan. Phase 1
+See [CLAUDE.md](CLAUDE.md) for the full spec and phased build plan. Phase 1
 (data pipeline + config plumbing) is what's implemented today.
 
 ## Prerequisites
@@ -195,7 +195,7 @@ make eval-all       # (phase 3) evaluates per-airport models
 better-wind/
 ├── pyproject.toml              # deps, ruff/mypy/pytest config, `wind-forecast` script
 ├── Makefile                    # ingest-all / train-all / eval-all / lint / test
-├── CLAUD.md                    # full spec + phased build plan
+├── CLAUDE.md                   # full spec + phased build plan
 ├── config/airports/            # one YAML per airport — the only place coords live
 │   ├── KMAN.yaml
 │   └── KBOI.yaml
