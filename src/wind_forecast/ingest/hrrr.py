@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterable, Iterator
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -29,6 +30,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_LEAD_HOURS: tuple[int, ...] = tuple(range(1, 19))  # +1h..+18h
 DEFAULT_GRID_HALF: int = 2  # -> 5x5 box
+DEFAULT_WORKERS: int = 8
 
 
 @dataclass(frozen=True)
@@ -133,6 +135,61 @@ def _box_to_rows(
     return rows
 
 
+def _fetch_lead(
+    cycle_naive_utc: datetime,
+    cycle_aware: datetime,
+    lead: int,
+    *,
+    airport: Airport,
+    variables: Iterable[HRRRVariableSpec],
+    grid_half: int,
+) -> pd.DataFrame | None:
+    """Fetch every variable for one (cycle, lead) into one frame.
+
+    Variables are pulled with one Herbie instance, so the .idx file is shared
+    across calls. Each variable still costs a byte-range fetch — the big
+    speedup comes from running this function in parallel across leads.
+    """
+    from herbie import Herbie  # deferred import
+
+    H = Herbie(cycle_naive_utc, model="hrrr", product="sfc", fxx=lead)
+    per_var_rows: dict[tuple[int, int, int], dict[str, Any]] = {}
+
+    for spec in variables:
+        try:
+            ds = H.xarray(spec.search)
+        except Exception as exc:
+            logger.warning(
+                "HRRR fetch failed cycle=%s lead=%d var=%s: %s",
+                cycle_aware.isoformat(), lead, spec.name, exc,
+            )
+            continue
+        box = _nearest_grid_box(ds, airport.latitude, airport.longitude, grid_half)
+        data_vars = list(box.data_vars)
+        if not data_vars:
+            continue
+        rows = _box_to_rows(box, data_vars[0], spec.out_prefix, cycle_aware, lead)
+        for row in rows:
+            key = (lead, row["iy"], row["ix"])
+            merged = per_var_rows.setdefault(
+                key,
+                {
+                    "cycle_utc": row["cycle_utc"],
+                    "lead_hour": row["lead_hour"],
+                    "valid_utc": row["valid_utc"],
+                    "iy": row["iy"],
+                    "ix": row["ix"],
+                    "latitude": row["latitude"],
+                    "longitude": row["longitude"],
+                },
+            )
+            merged[spec.out_prefix] = row[spec.out_prefix]
+
+    if not per_var_rows:
+        return None
+    return pd.DataFrame(list(per_var_rows.values()))
+
+
 def fetch_cycle(
     cycle: datetime,
     *,
@@ -140,12 +197,15 @@ def fetch_cycle(
     lead_hours: Iterable[int] = DEFAULT_LEAD_HOURS,
     variables: Iterable[HRRRVariableSpec] = HRRR_VARIABLES,
     grid_half: int = DEFAULT_GRID_HALF,
+    max_workers: int = DEFAULT_WORKERS,
 ) -> pd.DataFrame:
     """Fetch one HRRR init cycle and return a long/wide frame keyed by
     `(cycle_utc, lead_hour, iy, ix)` with one column per variable.
-    """
-    from herbie import Herbie  # deferred import
 
+    Lead hours are fetched in parallel with a `ThreadPoolExecutor` because
+    each (cycle, lead) is independent, network I/O bound, and Herbie/cfgrib
+    release the GIL during downloads and GRIB decoding.
+    """
     if cycle.tzinfo is None:
         cycle = cycle.replace(tzinfo=timezone.utc)
     # Herbie compares its internal date against a tz-naive pd.Timestamp.utcnow()
@@ -153,43 +213,42 @@ def fetch_cycle(
     # datetime; we keep the tz-aware `cycle` for our own output rows.
     cycle_naive_utc = cycle.astimezone(timezone.utc).replace(tzinfo=None)
 
-    per_lead: list[pd.DataFrame] = []
-    for lead in lead_hours:
-        H = Herbie(cycle_naive_utc, model="hrrr", product="sfc", fxx=lead)
-        per_var_rows: dict[tuple[int, int, int], dict[str, Any]] = {}
-        for spec in variables:
-            try:
-                ds = H.xarray(spec.search)
-            except Exception as exc:  # herbie raises assorted exceptions
-                logger.warning(
-                    "HRRR fetch failed cycle=%s lead=%d var=%s: %s",
-                    cycle.isoformat(), lead, spec.name, exc,
-                )
-                continue
-            box = _nearest_grid_box(ds, airport.latitude, airport.longitude, grid_half)
-            # Pick the single data variable in the dataset (herbie returns one).
-            data_vars = [v for v in box.data_vars]
-            if not data_vars:
-                continue
-            rows = _box_to_rows(box, data_vars[0], spec.out_prefix, cycle, lead)
-            for row in rows:
-                key = (lead, row["iy"], row["ix"])
-                merged = per_var_rows.setdefault(
-                    key,
-                    {
-                        "cycle_utc": row["cycle_utc"],
-                        "lead_hour": row["lead_hour"],
-                        "valid_utc": row["valid_utc"],
-                        "iy": row["iy"],
-                        "ix": row["ix"],
-                        "latitude": row["latitude"],
-                        "longitude": row["longitude"],
-                    },
-                )
-                merged[spec.out_prefix] = row[spec.out_prefix]
+    leads = list(lead_hours)
+    var_list = list(variables)
+    workers = max(1, min(max_workers, len(leads)))
 
-        if per_var_rows:
-            per_lead.append(pd.DataFrame(list(per_var_rows.values())))
+    per_lead: list[pd.DataFrame] = []
+    if workers == 1:
+        for lead in leads:
+            frame = _fetch_lead(
+                cycle_naive_utc, cycle, lead,
+                airport=airport, variables=var_list, grid_half=grid_half,
+            )
+            if frame is not None:
+                per_lead.append(frame)
+                logger.debug("cycle=%s lead=%d done", cycle.isoformat(), lead)
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(
+                    _fetch_lead, cycle_naive_utc, cycle, lead,
+                    airport=airport, variables=var_list, grid_half=grid_half,
+                ): lead
+                for lead in leads
+            }
+            for fut in as_completed(futures):
+                lead = futures[fut]
+                try:
+                    frame = fut.result()
+                except Exception as exc:
+                    logger.warning(
+                        "HRRR lead failed cycle=%s lead=%d: %s",
+                        cycle.isoformat(), lead, exc,
+                    )
+                    continue
+                if frame is not None:
+                    per_lead.append(frame)
+                    logger.debug("cycle=%s lead=%d done", cycle.isoformat(), lead)
 
     if not per_lead:
         return pd.DataFrame()
@@ -220,6 +279,7 @@ def ingest_airport(
     cycle_step_hours: int = 1,
     skip_existing: bool = True,
     data_root: Path = DEFAULT_DATA_ROOT,
+    max_workers: int = DEFAULT_WORKERS,
 ) -> list[Path]:
     """Ingest HRRR for every init cycle in `[start, end)`.
 
@@ -232,25 +292,39 @@ def ingest_airport(
     if isinstance(end, date) and not isinstance(end, datetime):
         end = datetime(end.year, end.month, end.day, tzinfo=timezone.utc)
 
+    cycles = list(iter_cycles(start, end, cycle_step_hours))
+    total = len(cycles)
+    logger.info(
+        "HRRR ingest: airport=%s cycles=%d leads=%s workers=%d",
+        airport.icao, total, list(lead_hours), max_workers,
+    )
+
     written: list[Path] = []
-    for cycle in iter_cycles(start, end, cycle_step_hours):
+    for idx, cycle in enumerate(cycles, start=1):
         path = cycle_path(cycle, airport, data_root)
         if skip_existing and path.exists():
-            logger.debug("Skip existing %s", path)
+            logger.info("[%d/%d] skip existing %s", idx, total, path.name)
             written.append(path)
             continue
+        t0 = datetime.now(tz=timezone.utc)
+        logger.info("[%d/%d] cycle %s", idx, total, cycle.isoformat())
         df = fetch_cycle(
             cycle,
             airport=airport,
             lead_hours=lead_hours,
             variables=variables,
             grid_half=grid_half,
+            max_workers=max_workers,
         )
+        elapsed = (datetime.now(tz=timezone.utc) - t0).total_seconds()
         if df.empty:
-            logger.warning("No data for cycle %s", cycle.isoformat())
+            logger.warning("[%d/%d] no data for cycle %s", idx, total, cycle.isoformat())
             continue
         path.parent.mkdir(parents=True, exist_ok=True)
         df.to_parquet(path, index=False)
-        logger.info("Wrote %d rows to %s", len(df), path)
+        logger.info(
+            "[%d/%d] wrote %d rows to %s in %.1fs",
+            idx, total, len(df), path.name, elapsed,
+        )
         written.append(path)
     return written

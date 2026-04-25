@@ -130,6 +130,10 @@ def ingest_metar_cmd(
 @click.option("--lead-max", type=int, default=18, show_default=True)
 @click.option("--step-hours", type=int, default=1, show_default=True)
 @click.option("--grid-half", type=int, default=2, show_default=True)
+@click.option(
+    "--workers", type=int, default=8, show_default=True,
+    help="Parallel lead-hour fetches per cycle.",
+)
 @click.option("--no-skip-existing", is_flag=True, help="Re-fetch cycles already on disk.")
 @config_dir_option
 @data_root_option
@@ -141,6 +145,7 @@ def ingest_hrrr_cmd(
     lead_max: int,
     step_hours: int,
     grid_half: int,
+    workers: int,
     no_skip_existing: bool,
     config_dir: Path,
     data_root: Path,
@@ -158,6 +163,7 @@ def ingest_hrrr_cmd(
         cycle_step_hours=step_hours,
         skip_existing=not no_skip_existing,
         data_root=data_root,
+        max_workers=workers,
     )
     click.echo(f"{len(paths)} cycles")
 
