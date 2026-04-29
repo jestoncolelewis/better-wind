@@ -145,6 +145,55 @@ def test_load_hrrr_forecasts_concats_year_dirs(tmp_path) -> None:
     assert {pd.Timestamp(t).year for t in df["cycle_utc"]} == {2024, 2025}
 
 
+def test_load_and_pair_handles_mixed_datetime_units(tmp_path) -> None:
+    """Regression: HRRR ingest writes Python datetimes (us precision); METAR is ns.
+
+    `merge_asof` requires identical dtypes, so the loaders must normalize.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from wind_forecast.config import Airport
+    from wind_forecast.eval.io import load_and_pair
+
+    airport = Airport(
+        icao="KTST", name="Test", latitude=40.0, longitude=-100.0,
+        elevation_ft=1000, timezone="UTC",
+        runways=[{"id": "10/28", "heading_deg_true": 100}],
+    )
+
+    cycle = datetime(2024, 6, 1, 0, 0, tzinfo=UTC)
+    hrrr_dir = airport.raw_hrrr_dir(tmp_path) / "2024"
+    hrrr_dir.mkdir(parents=True)
+    hrrr_df = pd.DataFrame([
+        {
+            "cycle_utc": cycle, "lead_hour": 1,
+            "valid_utc": cycle + timedelta(hours=1),
+            "iy": 0, "ix": 0, "latitude": 40.0, "longitude": -100.0,
+            "u10": 0.0, "v10": -5.0, "gust": 10.0,
+        },
+    ])
+    hrrr_df.to_parquet(hrrr_dir / "20240601_00Z.parquet", index=False)
+
+    metar_dir = airport.raw_metar_dir(tmp_path)
+    metar_dir.mkdir(parents=True)
+    metar_df = pd.DataFrame({
+        "station": pd.array(["KTST"], dtype="string"),
+        "valid_utc": pd.to_datetime(
+            ["2024-06-01T01:00"], utc=True
+        ).astype("datetime64[ns, UTC]"),
+        "drct": [180.0], "sknt": [5.0], "gust": [np.nan],
+        "u": [0.0], "v": [-5.0],
+        "tmpf": [70.0], "dwpf": [50.0],
+        "alti": [30.0], "mslp": [1015.0], "vsby": [10.0],
+        "metar": pd.array([""], dtype="string"),
+    })
+    metar_df.to_parquet(metar_dir / "KTST.parquet", index=False)
+
+    paired = load_and_pair(airport, data_root=tmp_path)
+    assert len(paired) == 1
+    assert paired.iloc[0]["obs_u"] == 0.0
+
+
 def test_load_hrrr_missing_dir_raises(tmp_path) -> None:
     from wind_forecast.config import Airport
 
