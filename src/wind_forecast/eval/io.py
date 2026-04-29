@@ -35,7 +35,7 @@ def load_metar_obs(
             f"METAR Parquet not found at {path}. Run `wind-forecast ingest-metar` first."
         )
     df = pd.read_parquet(path)
-    df["valid_utc"] = pd.to_datetime(df["valid_utc"], utc=True)
+    df["valid_utc"] = pd.to_datetime(df["valid_utc"], utc=True).astype("datetime64[ns, UTC]")
     return df.sort_values("valid_utc").reset_index(drop=True)
 
 
@@ -51,8 +51,10 @@ def load_hrrr_forecasts(
         )
     frames = [pd.read_parquet(f) for f in files]
     df = pd.concat(frames, ignore_index=True)
-    df["cycle_utc"] = pd.to_datetime(df["cycle_utc"], utc=True)
-    df["valid_utc"] = pd.to_datetime(df["valid_utc"], utc=True)
+    # PyArrow writes tz-aware Python datetimes at us precision; METAR ingest
+    # pins ns. Normalize both so merge_asof can join them.
+    df["cycle_utc"] = pd.to_datetime(df["cycle_utc"], utc=True).astype("datetime64[ns, UTC]")
+    df["valid_utc"] = pd.to_datetime(df["valid_utc"], utc=True).astype("datetime64[ns, UTC]")
     return df
 
 
