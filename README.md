@@ -5,7 +5,8 @@ per-airport YAML configs, per-airport trained models. Learns the residual bias
 of HRRR/TAF wind guidance instead of predicting raw wind.
 
 See [CLAUDE.md](CLAUDE.md) for the full spec and phased build plan. Phase 1
-(data pipeline + config plumbing) is what's implemented today.
+(data pipeline + config plumbing) and Phase 2 (deterministic baselines +
+evaluation harness) are implemented today.
 
 ## Prerequisites
 
@@ -48,10 +49,11 @@ have to activate the venv manually.
    KMAN  Nampa Municipal Airport  (43.5817, -116.5225)
    ```
 
-2. **Run the test suite.** 32 tests; should pass in under a second. Covers
+2. **Run the test suite.** 62 tests; should pass in under a second. Covers
    config validation, METAR schema stability across stations, wind u/v
-   round-trips, cycle iteration, path partitioning, date chunking, and
-   logging setup.
+   round-trips, cycle iteration, path partitioning, date chunking, logging
+   setup, plus the Phase 2 eval harness (HRRR↔obs pairing, baselines, and
+   metrics).
    ```bash
    uv run pytest
    ```
@@ -61,6 +63,7 @@ have to activate the venv manually.
    uv run wind-forecast --help
    uv run wind-forecast ingest-metar --help
    uv run wind-forecast ingest-hrrr  --help
+   uv run wind-forecast eval         --help
    ```
 
 ## Pull METAR observations (ground truth)
@@ -181,10 +184,37 @@ Required YAML fields: `icao`, `name`, `latitude`, `longitude`, `elevation_ft`,
 strongly recommended — those are the upstream ASOS/AWOS stations the feature
 builder will use for tendency signals.
 
+## Score the deterministic baselines (Phase 2)
+
+Once you've ingested both METAR and HRRR for an airport, score the baselines
+on a chronological 70/15/15 train/val/test split:
+
+```bash
+uv run wind-forecast eval --airport KMAN                 # overall summary
+uv run wind-forecast eval --airport KMAN --by-lead       # one row per forecast hour
+uv run wind-forecast eval --airport KMAN --baseline climatology
+```
+
+Three baselines run by default:
+
+- **`persistence`** — last METAR obs at cycle init time, carried forward to
+  every lead hour.
+- **`hrrr`** — the unmodified HRRR 10 m wind + surface gust at the airport's
+  nearest grid point.
+- **`climatology`** — HRRR minus the per-`(lead_hour, hour_of_day, month)`
+  mean bias learned on the training split. Captures the simple diurnal /
+  seasonal corrections the LightGBM model in Phase 3 has to beat.
+
+The output table reports RMSE/MAE on `u`, `v`, scalar speed, gust; circular
+direction MAE (masked at 3 kt observed wind); and CRPS on speed (which is just
+MAE for deterministic baselines — the column lights up properly once Phase 3
+adds quantile predictions).
+
 ## Running everything across every configured airport
 
 ```bash
 make ingest-all     # loops ingest-metar + ingest-hrrr for each YAML in config/airports/
+make eval-baselines # runs `wind-forecast eval --baseline all` for each airport
 make train-all      # (phase 3) trains per-airport models
 make eval-all       # (phase 3) evaluates per-airport models
 ```
@@ -204,9 +234,14 @@ better-wind/
 │   ├── winds.py                # (u, v) <-> (direction-from, speed)
 │   ├── logging_setup.py        # console + file logging, used by every CLI command
 │   ├── cli.py                  # `wind-forecast` click entry points
-│   └── ingest/
-│       ├── metar.py            # Iowa Mesonet bulk downloader (chunked + parallel)
-│       └── hrrr.py             # herbie wrapper, 5×5 grid extraction (parallel leads)
+│   ├── ingest/
+│   │   ├── metar.py            # Iowa Mesonet bulk downloader (chunked + parallel)
+│   │   └── hrrr.py             # herbie wrapper, 5×5 grid extraction (parallel leads)
+│   └── eval/
+│       ├── io.py               # load HRRR + METAR, pair on valid_utc / cycle_utc
+│       ├── metrics.py          # RMSE / MAE / circular dir error / CRPS
+│       ├── baselines.py        # persistence, raw HRRR, climatological bias
+│       └── harness.py          # chronological split + table formatter
 ├── data/                       # gitignored; all data outputs land here
 │   └── raw/
 │       ├── metar/{ICAO}/{STATION}.parquet
@@ -214,7 +249,7 @@ better-wind/
 ├── logs/                       # gitignored; one log file per CLI invocation
 ├── notebooks/
 │   └── 01_data_eda.ipynb       # wind rose, diurnal cycle, HRRR bias stub
-└── tests/                      # 32 tests covering config, schema, winds, chunks, logging
+└── tests/                      # 62 tests covering config, schema, winds, chunks, logging, eval
 ```
 
 ## Developer loop
@@ -229,7 +264,7 @@ All three must pass before commits.
 
 ## What's next
 
-Phase 2 (baselines) and Phase 3 (LightGBM residual model) are not yet
-implemented. See [CLAUDE.md](CLAUDE.md) for the full roadmap — the target for
-Phase 3 is to beat raw HRRR by ≥15% RMSE on scalar wind speed at forecast
-hour 6 for KMAN.
+Phase 3 (LightGBM residual model) is the next milestone. See
+[CLAUDE.md](CLAUDE.md) for the full roadmap — the target is to beat raw HRRR
+by ≥15% RMSE on scalar wind speed at forecast hour 6 for KMAN, then confirm
+the same pipeline beats raw HRRR at KBOI.
