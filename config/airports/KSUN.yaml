@@ -1,0 +1,20 @@
+# Sun Valley - test airport for addition
+
+icao: KSUN
+name: Friedman Memorial
+latitude: 43.504
+longitutde: -114.296
+elevation_ft: 5320
+timezone: America/Boise
+
+runways:
+ - id: "13/31"
+   heading_deg_true: 132
+
+neighbor_stations:
+ - KBOI
+ - KTWF
+ - KLLJ
+ - 2U7
+
+ history_start: "2015-01-01"
