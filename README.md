@@ -109,15 +109,41 @@ Tuning knobs:
 
 | Flag | Default | What it does |
 |---|---|---|
-| `--workers N` | 8 | Parallel lead-hour fetches per cycle |
+| `--cycle-workers N` | 4 | Cycles fetched concurrently |
+| `--workers N` | 8 | Parallel lead-hour fetches **within** one cycle |
 | `--lead-min` / `--lead-max` | 1 / 18 | Forecast-hour range to pull |
 | `--step-hours N` | 1 | Skip cycles (e.g. 3 = every 3rd init) |
 | `--grid-half N` | 2 | `(2N+1) × (2N+1)` box around the airport |
 | `--no-skip-existing` | off | Re-fetch cycles already on disk |
 
+### Throughput: tuning the two worker pools
+
+HRRR ingest has two tiers of parallelism. `--workers` parallelizes the
+~18 lead-hour fetches **inside one cycle** (capped by the lead-hour count, so
+values above ~18 don't help). `--cycle-workers` runs multiple cycles
+concurrently. Peak in-flight lead fetches ≈ `cycle-workers × workers`, so the
+defaults (4 × 8 = 32) is what to expect against your bandwidth and CPU.
+
+For a multi-year backfill, `--cycle-workers` is the knob that actually moves
+wall time. Each cycle is ~30–60 s end-to-end (download + GRIB decode + Parquet
+write); a 48 000-cycle backfill at default 4 concurrent cycles is roughly
+4–10 days, while raising it to `--cycle-workers 16` cuts that to roughly
+1–3 days. Suggested presets:
+
+| Scenario | Suggested flags |
+|---|---|
+| Quick sanity check, modest laptop | `--cycle-workers 1 --workers 8` |
+| Default workstation backfill | `--cycle-workers 4 --workers 8` (default) |
+| Beefy machine, fat pipe | `--cycle-workers 16 --workers 8` |
+| Hitting AWS rate limits / errors | back off `--cycle-workers` first |
+
+If you see repeated `HRRR fetch failed` warnings or your disk can't keep up,
+lower `--cycle-workers` before touching `--workers`. Re-runs skip cycles
+already on disk, so it's always safe to interrupt and resume with a different
+concurrency setting.
+
 > Start with a **short window first** (e.g. one day) to confirm your bandwidth
-> and disk can keep up. The full spec targets years of history. Re-runs skip
-> cycles already on disk, so it's safe to interrupt and resume.
+> and disk can keep up. The full spec targets years of history.
 
 ## Logging & progress
 

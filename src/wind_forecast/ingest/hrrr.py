@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_LEAD_HOURS: tuple[int, ...] = tuple(range(1, 19))  # +1h..+18h
 DEFAULT_GRID_HALF: int = 2  # -> 5x5 box
 DEFAULT_WORKERS: int = 8
+DEFAULT_CYCLE_WORKERS: int = 4
 
 
 @dataclass(frozen=True)
@@ -268,6 +269,42 @@ def cycle_path(cycle: datetime, airport: Airport, data_root: Path = DEFAULT_DATA
     )
 
 
+def _process_cycle(
+    cycle: datetime,
+    *,
+    airport: Airport,
+    lead_hours: Iterable[int],
+    variables: Iterable[HRRRVariableSpec],
+    grid_half: int,
+    skip_existing: bool,
+    data_root: Path,
+    max_workers: int,
+) -> Path | None:
+    """Fetch one cycle, write its Parquet, return the path (or None if empty)."""
+    path = cycle_path(cycle, airport, data_root)
+    if skip_existing and path.exists():
+        logger.debug("skip existing %s", path.name)
+        return path
+    t0 = datetime.now(tz=timezone.utc)
+    logger.info("cycle %s", cycle.isoformat())
+    df = fetch_cycle(
+        cycle,
+        airport=airport,
+        lead_hours=lead_hours,
+        variables=variables,
+        grid_half=grid_half,
+        max_workers=max_workers,
+    )
+    elapsed = (datetime.now(tz=timezone.utc) - t0).total_seconds()
+    if df.empty:
+        logger.warning("no data for cycle %s", cycle.isoformat())
+        return None
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(path, index=False)
+    logger.info("wrote %d rows to %s in %.1fs", len(df), path.name, elapsed)
+    return path
+
+
 def ingest_airport(
     airport: Airport,
     *,
@@ -280,12 +317,17 @@ def ingest_airport(
     skip_existing: bool = True,
     data_root: Path = DEFAULT_DATA_ROOT,
     max_workers: int = DEFAULT_WORKERS,
+    cycle_workers: int = DEFAULT_CYCLE_WORKERS,
 ) -> list[Path]:
     """Ingest HRRR for every init cycle in `[start, end)`.
 
     Writes one Parquet per cycle under `data/raw/hrrr/{icao}/{YYYY}/`.
     Returns the list of paths that were written (or already existed when
     `skip_existing=True`).
+
+    Concurrency is two-tiered: `cycle_workers` cycles are fetched in parallel,
+    and within each cycle `max_workers` lead hours are fetched in parallel.
+    Peak in-flight lead fetches is ~`cycle_workers * max_workers`.
     """
     if isinstance(start, date) and not isinstance(start, datetime):
         start = datetime(start.year, start.month, start.day, tzinfo=timezone.utc)
@@ -297,39 +339,48 @@ def ingest_airport(
 
     cycles = list(iter_cycles(start, end, cycle_step_hours))
     total = len(cycles)
+    cycle_pool_size = max(1, min(cycle_workers, total)) if total else 1
     logger.info(
-        "HRRR ingest: airport=%s cycles=%d leads=%s workers=%d",
-        airport.icao, total, list(lead_hours), max_workers,
+        "HRRR ingest: airport=%s cycles=%d leads=%s cycle_workers=%d lead_workers=%d",
+        airport.icao, total, list(lead_hours), cycle_pool_size, max_workers,
     )
+
+    def _run(cycle: datetime) -> Path | None:
+        return _process_cycle(
+            cycle,
+            airport=airport,
+            lead_hours=lead_hours,
+            variables=variables,
+            grid_half=grid_half,
+            skip_existing=skip_existing,
+            data_root=data_root,
+            max_workers=max_workers,
+        )
 
     written: list[Path] = []
     bar = tqdm(total=total, desc=f"HRRR {airport.icao}", unit="cycle", dynamic_ncols=True)
     with logging_redirect_tqdm(), bar:
-        for cycle in cycles:
-            path = cycle_path(cycle, airport, data_root)
-            if skip_existing and path.exists():
-                logger.debug("skip existing %s", path.name)
-                written.append(path)
+        if cycle_pool_size == 1:
+            for cycle in cycles:
+                try:
+                    path = _run(cycle)
+                except Exception as exc:
+                    logger.warning("cycle %s failed: %s", cycle.isoformat(), exc)
+                    path = None
+                if path is not None:
+                    written.append(path)
                 bar.update(1)
-                continue
-            t0 = datetime.now(tz=timezone.utc)
-            logger.info("cycle %s", cycle.isoformat())
-            df = fetch_cycle(
-                cycle,
-                airport=airport,
-                lead_hours=lead_hours,
-                variables=variables,
-                grid_half=grid_half,
-                max_workers=max_workers,
-            )
-            elapsed = (datetime.now(tz=timezone.utc) - t0).total_seconds()
-            if df.empty:
-                logger.warning("no data for cycle %s", cycle.isoformat())
-                bar.update(1)
-                continue
-            path.parent.mkdir(parents=True, exist_ok=True)
-            df.to_parquet(path, index=False)
-            logger.info("wrote %d rows to %s in %.1fs", len(df), path.name, elapsed)
-            written.append(path)
-            bar.update(1)
+        else:
+            with ThreadPoolExecutor(max_workers=cycle_pool_size) as pool:
+                futures = {pool.submit(_run, c): c for c in cycles}
+                for fut in as_completed(futures):
+                    cycle = futures[fut]
+                    try:
+                        path = fut.result()
+                    except Exception as exc:
+                        logger.warning("cycle %s failed: %s", cycle.isoformat(), exc)
+                        path = None
+                    if path is not None:
+                        written.append(path)
+                    bar.update(1)
     return written
