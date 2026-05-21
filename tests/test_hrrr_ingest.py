@@ -12,7 +12,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from wind_forecast.config import Airport
-from wind_forecast.ingest.hrrr import cycle_path, iter_cycles
+from wind_forecast.ingest.hrrr import IngestSummary, _humanize, cycle_path, iter_cycles
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CONFIG_DIR = REPO_ROOT / "config" / "airports"
@@ -64,3 +64,22 @@ def test_history_window_respects_airport_start() -> None:
     # history floor. This is the check the CLI (and feature builder) will
     # enforce; we're only asserting the config surface it relies on.
     assert airport.history_start >= date(2014, 1, 1)
+
+
+def test_humanize_row_counts() -> None:
+    assert _humanize(0) == "0"
+    assert _humanize(42) == "42"
+    assert _humanize(1500) == "1.5k"
+    assert _humanize(216_000) == "216.0k"
+    assert _humanize(1_250_000) == "1.2M"
+
+
+def test_ingest_summary_postfix() -> None:
+    s = IngestSummary(total=10, written=4, skipped=3, empty=1, failed=2, rows=216_000)
+    assert s.done == 10
+    pf = s.postfix()
+    assert pf["new"] == "4"
+    assert pf["skip"] == "3"
+    # `fail` rolls empty into failed so the user sees one "things-went-wrong" bucket
+    assert pf["fail"] == "3"
+    assert pf["rows"] == "216.0k"

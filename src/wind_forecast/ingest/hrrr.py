@@ -16,17 +16,64 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 import pandas as pd
 
-from wind_forecast.config import Airport, DEFAULT_DATA_ROOT
+from wind_forecast.config import DEFAULT_DATA_ROOT, Airport
 
 if TYPE_CHECKING:
     import xarray as xr
 
 logger = logging.getLogger(__name__)
+
+CycleStatus = Literal["written", "skipped", "empty"]
+
+
+@dataclass(frozen=True)
+class CycleResult:
+    """Outcome of fetching one HRRR init cycle."""
+
+    cycle: datetime
+    path: Path | None
+    status: CycleStatus
+    rows: int
+
+
+@dataclass
+class IngestSummary:
+    """Aggregate counts across an ingest run."""
+
+    total: int = 0
+    written: int = 0
+    skipped: int = 0
+    empty: int = 0
+    failed: int = 0
+    rows: int = 0
+
+    @property
+    def done(self) -> int:
+        return self.written + self.skipped + self.empty + self.failed
+
+    def postfix(self) -> dict[str, str]:
+        return {
+            "new": str(self.written),
+            "skip": str(self.skipped),
+            "fail": str(self.failed + self.empty),
+            "rows": _humanize(self.rows),
+        }
+
+
+def _humanize(n: int) -> str:
+    if n < 1000:
+        return str(n)
+    if n < 1_000_000:
+        return f"{n / 1000:.1f}k"
+    if n < 1_000_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    return f"{n / 1_000_000_000:.1f}G"
+
 
 DEFAULT_LEAD_HOURS: tuple[int, ...] = tuple(range(1, 19))  # +1h..+18h
 DEFAULT_GRID_HALF: int = 2  # -> 5x5 box
@@ -153,7 +200,10 @@ def _fetch_lead(
     """
     from herbie import Herbie  # deferred import
 
-    H = Herbie(cycle_naive_utc, model="hrrr", product="sfc", fxx=lead)
+    # verbose=False suppresses Herbie's "Downloading inventory file from..."
+    # prints. We can't safely redirect sys.stdout here because this runs in
+    # many threads concurrently and they would race on the global handle.
+    H = Herbie(cycle_naive_utc, model="hrrr", product="sfc", fxx=lead, verbose=False)
     per_var_rows: dict[tuple[int, int, int], dict[str, Any]] = {}
 
     for spec in variables:
@@ -279,14 +329,14 @@ def _process_cycle(
     skip_existing: bool,
     data_root: Path,
     max_workers: int,
-) -> Path | None:
-    """Fetch one cycle, write its Parquet, return the path (or None if empty)."""
+) -> CycleResult:
+    """Fetch one cycle and write its Parquet. Reports status + row count."""
     path = cycle_path(cycle, airport, data_root)
     if skip_existing and path.exists():
         logger.debug("skip existing %s", path.name)
-        return path
+        return CycleResult(cycle, path, "skipped", 0)
     t0 = datetime.now(tz=timezone.utc)
-    logger.info("cycle %s", cycle.isoformat())
+    logger.debug("cycle %s", cycle.isoformat())
     df = fetch_cycle(
         cycle,
         airport=airport,
@@ -298,11 +348,11 @@ def _process_cycle(
     elapsed = (datetime.now(tz=timezone.utc) - t0).total_seconds()
     if df.empty:
         logger.warning("no data for cycle %s", cycle.isoformat())
-        return None
+        return CycleResult(cycle, None, "empty", 0)
     path.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(path, index=False)
-    logger.info("wrote %d rows to %s in %.1fs", len(df), path.name, elapsed)
-    return path
+    logger.debug("wrote %d rows to %s in %.1fs", len(df), path.name, elapsed)
+    return CycleResult(cycle, path, "written", len(df))
 
 
 def ingest_airport(
@@ -318,12 +368,12 @@ def ingest_airport(
     data_root: Path = DEFAULT_DATA_ROOT,
     max_workers: int = DEFAULT_WORKERS,
     cycle_workers: int = DEFAULT_CYCLE_WORKERS,
-) -> list[Path]:
+) -> IngestSummary:
     """Ingest HRRR for every init cycle in `[start, end)`.
 
-    Writes one Parquet per cycle under `data/raw/hrrr/{icao}/{YYYY}/`.
-    Returns the list of paths that were written (or already existed when
-    `skip_existing=True`).
+    Writes one Parquet per cycle under `data/raw/hrrr/{icao}/{YYYY}/` and
+    returns an `IngestSummary` with counts (written / skipped / failed /
+    empty) and the total row count.
 
     Concurrency is two-tiered: `cycle_workers` cycles are fetched in parallel,
     and within each cycle `max_workers` lead hours are fetched in parallel.
@@ -335,7 +385,8 @@ def ingest_airport(
         end = datetime(end.year, end.month, end.day, tzinfo=timezone.utc)
 
     from tqdm.auto import tqdm
-    from tqdm.contrib.logging import logging_redirect_tqdm
+
+    from wind_forecast.logging_setup import progress_logging
 
     cycles = list(iter_cycles(start, end, cycle_step_hours))
     total = len(cycles)
@@ -345,7 +396,7 @@ def ingest_airport(
         airport.icao, total, list(lead_hours), cycle_pool_size, max_workers,
     )
 
-    def _run(cycle: datetime) -> Path | None:
+    def _run(cycle: datetime) -> CycleResult:
         return _process_cycle(
             cycle,
             airport=airport,
@@ -357,30 +408,53 @@ def ingest_airport(
             max_workers=max_workers,
         )
 
-    written: list[Path] = []
+    summary = IngestSummary(total=total)
     bar = tqdm(total=total, desc=f"HRRR {airport.icao}", unit="cycle", dynamic_ncols=True)
-    with logging_redirect_tqdm(), bar:
+
+    def _record(cycle: datetime, result: CycleResult | None, exc: Exception | None) -> None:
+        if exc is not None:
+            summary.failed += 1
+            logger.warning("cycle %s failed: %s", cycle.isoformat(), exc)
+        else:
+            assert result is not None
+            if result.status == "written":
+                summary.written += 1
+                summary.rows += result.rows
+            elif result.status == "skipped":
+                summary.skipped += 1
+            else:
+                summary.empty += 1
+        bar.set_postfix(summary.postfix(), refresh=False)
+        bar.update(1)
+
+    with progress_logging(), bar:
         if cycle_pool_size == 1:
             for cycle in cycles:
                 try:
-                    path = _run(cycle)
+                    result = _run(cycle)
                 except Exception as exc:
-                    logger.warning("cycle %s failed: %s", cycle.isoformat(), exc)
-                    path = None
-                if path is not None:
-                    written.append(path)
-                bar.update(1)
+                    _record(cycle, None, exc)
+                    continue
+                _record(cycle, result, None)
         else:
             with ThreadPoolExecutor(max_workers=cycle_pool_size) as pool:
                 futures = {pool.submit(_run, c): c for c in cycles}
                 for fut in as_completed(futures):
                     cycle = futures[fut]
                     try:
-                        path = fut.result()
+                        result = fut.result()
                     except Exception as exc:
-                        logger.warning("cycle %s failed: %s", cycle.isoformat(), exc)
-                        path = None
-                    if path is not None:
-                        written.append(path)
-                    bar.update(1)
-    return written
+                        _record(cycle, None, exc)
+                        continue
+                    _record(cycle, result, None)
+
+    logger.info(
+        "HRRR ingest done: airport=%s new=%d skip=%d fail=%d empty=%d rows=%d",
+        airport.icao,
+        summary.written,
+        summary.skipped,
+        summary.failed,
+        summary.empty,
+        summary.rows,
+    )
+    return summary

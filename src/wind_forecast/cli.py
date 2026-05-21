@@ -182,7 +182,7 @@ def ingest_hrrr_cmd(
     from wind_forecast.ingest import hrrr as hrrr_ingest  # deferred
 
     airport = Airport.load(airport_icao, config_dir)
-    paths = hrrr_ingest.ingest_airport(
+    summary = hrrr_ingest.ingest_airport(
         airport,
         start=start,
         end=end,
@@ -194,7 +194,12 @@ def ingest_hrrr_cmd(
         max_workers=workers,
         cycle_workers=cycle_workers,
     )
-    click.echo(f"{len(paths)} cycles")
+    click.echo(
+        f"HRRR {airport.icao}: {summary.total} cycles "
+        f"({summary.written} new, {summary.skipped} skipped, "
+        f"{summary.failed} failed, {summary.empty} empty, "
+        f"{summary.rows:,} rows)"
+    )
 
 
 @cli.command("eval")

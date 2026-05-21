@@ -22,7 +22,7 @@ import numpy as np
 import pandas as pd
 import requests
 
-from wind_forecast.config import Airport, DEFAULT_DATA_ROOT
+from wind_forecast.config import DEFAULT_DATA_ROOT, Airport
 from wind_forecast.winds import dir_speed_to_uv
 
 logger = logging.getLogger(__name__)
@@ -294,11 +294,12 @@ def ingest_airport(
     )
 
     from tqdm.auto import tqdm
-    from tqdm.contrib.logging import logging_redirect_tqdm
+
+    from wind_forecast.logging_setup import progress_logging
 
     chunks_by_station: dict[str, list[pd.DataFrame]] = {s: [] for s in stations}
     bar = tqdm(total=len(tasks), desc=f"METAR {airport.icao}", unit="chunk", dynamic_ncols=True)
-    with logging_redirect_tqdm(), bar, ThreadPoolExecutor(max_workers=workers) as pool:
+    with progress_logging(), bar, ThreadPoolExecutor(max_workers=workers) as pool:
         future_map = {
             pool.submit(_fetch_chunk, station, s, e): (station, s, e)
             for station, s, e in tasks
