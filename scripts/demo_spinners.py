@@ -119,10 +119,15 @@ def demo_phased_echo() -> None:
 
 
 # ─── Option F: rich Live ribbon banner ───────────────────────────────────────
-# Full-panel "task list" — completed phases stay on screen with their result
-# and timing, the active phase shows a live spinner, and a progress bar +
-# elapsed clock pin to the top. Closer to `terraform plan` / `vercel deploy`.
+# MAXIMAL version — every plausibly-useful piece of info, intended to be pared
+# back. Includes: run-context title (airport, leads, date range), top progress
+# bar with %, step counter, elapsed, ETA; per-phase rows with status glyph,
+# label, result stats, color-coded skill delta vs HRRR, relative-duration
+# sparkline, absolute duration; active phase shows nested sub-progress;
+# pending phases shown dim; final ranking row; footer with log path + memory.
 def demo_ribbon() -> None:
+    import os
+
     from rich.console import Console, Group
     from rich.live import Live
     from rich.panel import Panel
@@ -133,62 +138,192 @@ def demo_ribbon() -> None:
 
     console = Console()
 
+    # ── Run-context constants the real eval would have on hand ──────────────
+    AIRPORT = "KMAN"
+    LEAD_RANGE = "1–18"
+    DATE_RANGE = "2020-01-01 → 2024-12-31"
+    LOG_PATH = "logs/wind-forecast-2026-05-21T19:59Z.log"
+    HRRR_RMSE = 3.87  # used for skill-vs-HRRR coloring
+
+    # Extra per-phase detail (sub-progress and a skill delta where applicable).
+    PHASE_DETAIL: dict[str, dict[str, object]] = {
+        "loading HRRR forecasts":     {"sub_total": 4151, "sub_unit": "cycles"},
+        "loading METAR observations": {"sub_total": 5,    "sub_unit": "stations"},
+        "pairing forecasts to obs":   {"unmatched": 339},
+        "chronological split":        {},
+        "scoring persistence":        {"rmse": 4.21, "crps": 2.41},
+        "scoring hrrr":               {"rmse": 3.87, "crps": 2.18},
+        "scoring climatology":        {"rmse": 3.95, "crps": 2.24},
+    }
+
+    def skill_delta(label: str) -> Text | None:
+        rmse = PHASE_DETAIL.get(label, {}).get("rmse")
+        if not isinstance(rmse, float):
+            return None
+        if label == "scoring hrrr":
+            return Text("baseline", style="dim")
+        skill = 1 - rmse / HRRR_RMSE  # >0 = better than HRRR
+        color = "green" if skill > 0 else "red"
+        sign = "+" if skill > 0 else ""
+        return Text(f"{sign}{skill * 100:.1f}% vs HRRR", style=color)
+
+    # Sparkline cells for relative phase cost. Filled in as phases finish.
+    SPARK = "▁▂▃▄▅▆▇█"
+    def spark(secs: float, max_secs: float) -> str:
+        if max_secs <= 0:
+            return SPARK[0]
+        idx = min(len(SPARK) - 1, int(secs / max_secs * (len(SPARK) - 1)))
+        return SPARK[idx]
+
     progress = Progress(
-        TextColumn("[bold cyan]eval KMAN"),
+        TextColumn("[bold cyan]eval {task.fields[airport]}"),
         BarColumn(bar_width=40),
         TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
         TextColumn("· step {task.completed}/{task.total}"),
         TextColumn("· [dim]elapsed[/] {task.fields[elapsed]}"),
+        TextColumn("· [dim]eta[/] {task.fields[eta]}"),
     )
-    task_id = progress.add_task("eval", total=len(PHASES), elapsed="0.0s")
+    task_id = progress.add_task(
+        "eval", total=len(PHASES), airport=AIRPORT, elapsed="0.0s", eta="—",
+    )
 
     completed: list[tuple[str, str, float]] = []  # (label, result, secs)
     started = time.monotonic()
 
-    def render(active: str | None) -> Panel:
+    def memory_mb() -> int:
+        # Rough RSS (Linux only); falls back to a fake number for portability.
+        try:
+            with open("/proc/self/status") as fh:
+                for line in fh:
+                    if line.startswith("VmRSS:"):
+                        return int(line.split()[1]) // 1024
+        except OSError:
+            pass
+        return 412
+
+    def render(active: str | None, sub_done: int = 0) -> Panel:
+        max_secs = max((s for _, _, s in completed), default=0.0)
+
         rows = Table.grid(padding=(0, 1), expand=True)
         rows.add_column(width=2)        # status glyph
-        rows.add_column(ratio=2)        # phase label
-        rows.add_column(ratio=2)        # result
-        rows.add_column(justify="right")  # timing
+        rows.add_column(ratio=3)        # phase label
+        rows.add_column(ratio=4)        # result + skill
+        rows.add_column(width=1)        # spark
+        rows.add_column(justify="right", width=6)  # timing
 
         for label, result, secs in completed:
+            result_text = Text(result, style="dim")
+            delta = skill_delta(label)
+            if delta is not None:
+                result_text.append("  ")
+                result_text.append_text(delta)
             rows.add_row(
                 Text("✓", style="green"),
                 Text(label),
-                Text(result, style="dim"),
+                result_text,
+                Text(spark(secs, max_secs), style="cyan"),
                 Text(f"{secs:.1f}s", style="dim"),
             )
+
         if active is not None:
+            detail = PHASE_DETAIL.get(active, {})
+            sub_total = detail.get("sub_total")
+            if isinstance(sub_total, int):
+                sub_unit = detail.get("sub_unit", "")
+                result_cell: Text = Text(
+                    f"{sub_done:,}/{sub_total:,} {sub_unit}", style="cyan",
+                )
+            else:
+                result_cell = Text("…", style="dim")
             rows.add_row(
                 Spinner("dots", style="cyan"),
                 Text(active, style="bold"),
-                Text("…", style="dim"),
+                result_cell,
+                Text(""),
                 Text(""),
             )
 
-        body = Group(progress, Text(""), rows)
+        # Pending phases listed dim so the operator can see what's coming.
+        done_labels = {lbl for lbl, _, _ in completed}
+        for label, _ in PHASES:
+            if label in done_labels or label == active:
+                continue
+            rows.add_row(
+                Text("◯", style="dim"),
+                Text(label, style="dim"),
+                Text("pending", style="dim"),
+                Text(""),
+                Text(""),
+            )
+
+        # Final ranking row, only after every baseline has scored.
+        ranking: Text | None = None
+        if len(completed) == len(PHASES):
+            scored = [
+                (lbl.removeprefix("scoring "), PHASE_DETAIL[lbl]["rmse"])
+                for lbl, _, _ in completed
+                if "rmse" in PHASE_DETAIL.get(lbl, {})
+            ]
+            scored.sort(key=lambda t: t[1])  # type: ignore[arg-type]
+            ranking = Text("ranking: ", style="bold")
+            for i, (name, rmse) in enumerate(scored):
+                if i:
+                    ranking.append("  →  ", style="dim")
+                ranking.append(f"{name} ", style="cyan")
+                ranking.append(f"({rmse:.2f} kt)", style="dim")
+
+        footer = Text.from_markup(
+            f"[dim]log:[/] {LOG_PATH}  ·  [dim]mem:[/] {memory_mb()} MB  ·  "
+            f"[dim]pid:[/] {os.getpid()}"
+        )
+
+        body_items = [progress, Text(""), rows]
+        if ranking is not None:
+            body_items += [Text(""), ranking]
+        body_items += [Text(""), footer]
+
         return Panel(
-            body,
+            Group(*body_items),
             border_style="cyan",
-            title="[bold]wind-forecast[/]",
+            title=(
+                f"[bold]wind-forecast[/] · [bold]eval {AIRPORT}[/] · "
+                f"leads {LEAD_RANGE} · {DATE_RANGE}"
+            ),
             title_align="left",
             subtitle=f"[dim]{len(completed)}/{len(PHASES)} done[/]",
             subtitle_align="right",
         )
 
+    total_planned = sum(d for _, d in PHASES)
+
     with Live(render(PHASES[0][0]), console=console, refresh_per_second=12) as live:
         for label, dur in PHASES:
             phase_start = time.monotonic()
-            live.update(render(label))
-            time.sleep(dur)
-            completed.append((label, PHASE_RESULTS[label], time.monotonic() - phase_start))
+            detail = PHASE_DETAIL.get(label, {})
+            sub_total = detail.get("sub_total")
+
+            # If the phase has a sub-progress, tick through it visibly.
+            if isinstance(sub_total, int):
+                ticks = 12
+                for i in range(1, ticks + 1):
+                    live.update(render(label, sub_done=int(sub_total * i / ticks)))
+                    time.sleep(dur / ticks)
+            else:
+                live.update(render(label))
+                time.sleep(dur)
+
+            secs = time.monotonic() - phase_start
+            completed.append((label, PHASE_RESULTS[label], secs))
+            elapsed = time.monotonic() - started
+            remaining = max(0.0, total_planned - elapsed)
             progress.update(
                 task_id,
                 advance=1,
-                elapsed=f"{time.monotonic() - started:.1f}s",
+                elapsed=f"{elapsed:.1f}s",
+                eta=f"~{remaining:.1f}s" if remaining > 0 else "—",
             )
             live.update(render(None))
+
         live.update(render(None))
 
 
