@@ -38,9 +38,9 @@ from rich.text import Text
 _SPARK = "▁▂▃▄▅▆▇█"
 
 
-class _DynamicEtaColumn(ProgressColumn):
-    """ETA whose text is computed by a callable on each render — lets eta
-    tick at Live's refresh rate without push updates."""
+class _DynamicTextColumn(ProgressColumn):
+    """Column whose markup is computed by a callable on each render — lets
+    counters tick at Live's refresh rate without push updates."""
 
     def __init__(self, compute: Callable[[], str]) -> None:
         super().__init__()
@@ -48,7 +48,24 @@ class _DynamicEtaColumn(ProgressColumn):
 
     def render(self, task: Any) -> Text:
         del task
-        return Text.from_markup(f"· [dim]eta[/] {self._compute()}")
+        return Text.from_markup(self._compute())
+
+
+def _fmt_duration(secs: float) -> str:
+    """Compact human-readable duration. Top two units, e.g. `2d07h`, `1h05m`."""
+    if secs < 0:
+        secs = 0
+    if secs < 60:
+        return f"{secs:.1f}s"
+    s = int(round(secs))
+    m, s = divmod(s, 60)
+    if m < 60:
+        return f"{m}m{s:02d}s"
+    h, m = divmod(m, 60)
+    if h < 24:
+        return f"{h}h{m:02d}m"
+    d, h = divmod(h, 24)
+    return f"{d}d{h:02d}h"
 
 
 @dataclass
@@ -95,19 +112,19 @@ class JobRibbon:
     # ── context manager ─────────────────────────────────────────────────────
     def __enter__(self) -> JobRibbon:
         self._console = Console(stderr=True)
-        # `task.elapsed` and the dynamic eta column are evaluated each render,
-        # so both counters tick at Live's refresh rate without push updates.
+        self._started = time.monotonic()
+        # Dynamic columns are evaluated each render, so the counters tick at
+        # Live's refresh rate without us having to push updates.
         self._progress = Progress(
             TextColumn(f"[bold cyan]{self.title}"),
             BarColumn(bar_width=40),
             TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
             TextColumn("· step {task.completed}/{task.total}"),
-            TextColumn("· [dim]elapsed[/] {task.elapsed:.1f}s"),
-            _DynamicEtaColumn(self._compute_eta),
+            _DynamicTextColumn(self._compute_elapsed),
+            _DynamicTextColumn(self._compute_eta),
             console=self._console,
         )
         self._task_id = self._progress.add_task("job", total=len(self.all_phases))
-        self._started = time.monotonic()
 
         # Route logs through rich so warnings don't tear the live region.
         self._log_redirect = rich_progress_logging(self._console)
@@ -159,6 +176,10 @@ class JobRibbon:
             self._progress.update(self._task_id, advance=1)
         self._refresh()
 
+    def _compute_elapsed(self) -> str:
+        elapsed = time.monotonic() - self._started
+        return f"· [dim]elapsed[/] {_fmt_duration(elapsed)}"
+
     def _compute_eta(self) -> str:
         """Best-effort ETA, recomputed on every render.
 
@@ -166,21 +187,24 @@ class JobRibbon:
         observed rate. Otherwise falls back to average completed-phase
         duration × remaining phases.
         """
+        remaining: float | None = None
         if self._active and self._sub_total > 0 and self._sub_done > 0:
             active_elapsed = time.monotonic() - self._active_start
             if active_elapsed > 0:
                 rate = self._sub_done / active_elapsed
                 if rate > 0:
                     remaining = (self._sub_total - self._sub_done) / rate
-                    return f"~{remaining:.1f}s"
 
-        done = len(self._completed)
-        if 0 < done < len(self.all_phases):
-            elapsed = time.monotonic() - self._started
-            avg = elapsed / done
-            return f"~{avg * (len(self.all_phases) - done):.1f}s"
+        if remaining is None:
+            done = len(self._completed)
+            if 0 < done < len(self.all_phases):
+                elapsed = time.monotonic() - self._started
+                avg = elapsed / done
+                remaining = avg * (len(self.all_phases) - done)
 
-        return "—"
+        if remaining is None:
+            return "· [dim]eta[/] —"
+        return f"· [dim]eta[/] ~{_fmt_duration(remaining)}"
 
     def sub_progress(
         self,
