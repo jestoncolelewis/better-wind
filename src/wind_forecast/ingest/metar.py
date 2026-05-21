@@ -135,7 +135,10 @@ def _fetch_station_csv(
             return r.text
         except requests.RequestException as e:
             last_exc = e
-            logger.warning(
+            # Per-attempt retry — informational, the final chunk-failed
+            # message at WARNING level is the visible escalation if all
+            # retries are exhausted.
+            logger.info(
                 "Mesonet fetch failed for %s (attempt %d/%d): %s",
                 station, attempt + 1, max_retries, e,
             )

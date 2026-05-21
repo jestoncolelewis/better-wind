@@ -212,7 +212,11 @@ def _fetch_lead(
         try:
             ds = H.xarray(spec.search)
         except Exception as exc:
-            logger.warning(
+            # Per-variable failures are expected during backfills (missing
+            # GRIB on AWS, herbie subset edge cases on early cycles). Log to
+            # file at INFO; the ribbon's `failed` counter is the user-facing
+            # signal. Bump to WARNING if it ever blocks operational use.
+            logger.info(
                 "HRRR fetch failed cycle=%s lead=%d var=%s: %s",
                 cycle_aware.isoformat(), lead, spec.name, exc,
             )
@@ -294,7 +298,7 @@ def fetch_cycle(
                 try:
                     frame = fut.result()
                 except Exception as exc:
-                    logger.warning(
+                    logger.info(
                         "HRRR lead failed cycle=%s lead=%d: %s",
                         cycle.isoformat(), lead, exc,
                     )
@@ -349,7 +353,7 @@ def _process_cycle(
     )
     elapsed = (datetime.now(tz=timezone.utc) - t0).total_seconds()
     if df.empty:
-        logger.warning("no data for cycle %s", cycle.isoformat())
+        logger.info("no data for cycle %s", cycle.isoformat())
         return CycleResult(cycle, None, "empty", 0)
     path.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(path, index=False)
@@ -431,7 +435,7 @@ def ingest_airport(
         nonlocal done
         if exc is not None:
             summary.failed += 1
-            logger.warning("cycle %s failed: %s", cycle.isoformat(), exc)
+            logger.info("cycle %s failed: %s", cycle.isoformat(), exc)
         else:
             assert result is not None
             if result.status == "written":
