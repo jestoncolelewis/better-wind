@@ -10,7 +10,7 @@ correction) for one airport. `run` glues all three together for a one-shot
 from __future__ import annotations
 
 import logging
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +20,43 @@ from wind_forecast.config import DEFAULT_CONFIG_DIR, DEFAULT_DATA_ROOT, Airport
 from wind_forecast.logging_setup import setup_logging
 
 log = logging.getLogger("wind_forecast")
+
+# Preset bundles for `wind-forecast run --profile <name>`. Each preset's values
+# only kick in for flags the user did NOT pass explicitly — explicit CLI args
+# always win. `lookback_days` is special: it sets the default start date to
+# `today - N days` when --start is omitted.
+PROFILES: dict[str, dict[str, Any]] = {
+    "pi": {
+        # Tuned for a Raspberry Pi 5 — trims the range, subsamples cycles,
+        # drops the tail of the lead window, and lowers parallelism so we
+        # don't oversaturate the Pi's network + cores. Targets ~30min total.
+        "lookback_days": 30,
+        "step_hours": 3,
+        "lead_max": 12,
+        "metar_workers": 2,
+        "hrrr_workers": 4,
+        "hrrr_cycle_workers": 2,
+    },
+}
+
+
+def _apply_profile(
+    profile: str | None,
+    explicit_flags: set[str],
+    **values: Any,
+) -> dict[str, Any]:
+    """Merge profile defaults over `values`, but skip any flag the user passed.
+
+    `explicit_flags` is the set of CLI flag names whose source isn't
+    Click's default — those win and are passed through untouched.
+    """
+    if not profile or profile not in PROFILES:
+        return dict(values)
+    preset = PROFILES[profile]
+    return {
+        name: preset[name] if name in preset and name not in explicit_flags else current
+        for name, current in values.items()
+    }
 
 
 def _parse_date(ctx: click.Context, param: click.Parameter, value: str | None) -> date | None:
@@ -414,8 +451,16 @@ def eval_cmd(
 @cli.command("run")
 @airport_option
 @click.option(
+    "--profile",
+    type=click.Choice(sorted(PROFILES)),
+    default=None,
+    help="Apply a preset of defaults (e.g. `pi` for Raspberry Pi 5 testing). "
+         "Explicit flags override profile values.",
+)
+@click.option(
     "--start", callback=_parse_date,
-    help="HRRR + METAR start date (YYYY-MM-DD). Default: airport.history_start.",
+    help="HRRR + METAR start date (YYYY-MM-DD). Default: airport.history_start "
+         "(or `today - profile.lookback_days` if a profile sets that).",
 )
 @click.option(
     "--end", callback=_parse_date,
@@ -423,6 +468,10 @@ def eval_cmd(
 )
 @click.option("--lead-min", type=int, default=1, show_default=True)
 @click.option("--lead-max", type=int, default=18, show_default=True)
+@click.option(
+    "--step-hours", type=int, default=1, show_default=True,
+    help="Subsample HRRR init cycles (e.g. 3 = every 3rd hour).",
+)
 @click.option(
     "--metar-workers", type=int, default=4, show_default=True,
     help="Parallel METAR (station, chunk) fetches.",
@@ -447,10 +496,12 @@ def eval_cmd(
 def run_cmd(
     ctx: click.Context,
     airport_icao: str,
+    profile: str | None,
     start: date | None,
     end: date | None,
     lead_min: int,
     lead_max: int,
+    step_hours: int,
     metar_workers: int,
     hrrr_workers: int,
     hrrr_cycle_workers: int,
@@ -464,15 +515,51 @@ def run_cmd(
 
     Defaults to the airport's `history_start → today UTC`. Each step opens
     its own ribbon; the final eval table prints at the end.
+
+    Use `--profile pi` to apply Raspberry Pi-friendly defaults — trims the
+    range to the last 30 days, samples every 3rd cycle, leads 1–12, and
+    halves the worker counts. Explicit flags still win.
     """
     from wind_forecast.eval import baselines as bl
     from wind_forecast.eval.harness import format_table
 
     airport = Airport.load(airport_icao, config_dir)
+
+    explicit_flags = {
+        name
+        for name in (
+            "lead_max", "step_hours",
+            "metar_workers", "hrrr_workers", "hrrr_cycle_workers",
+        )
+        if ctx.get_parameter_source(name) != click.core.ParameterSource.DEFAULT
+    }
+    resolved = _apply_profile(
+        profile, explicit_flags,
+        lead_max=lead_max, step_hours=step_hours,
+        metar_workers=metar_workers, hrrr_workers=hrrr_workers,
+        hrrr_cycle_workers=hrrr_cycle_workers,
+    )
+    lead_max = resolved["lead_max"]
+    step_hours = resolved["step_hours"]
+    metar_workers = resolved["metar_workers"]
+    hrrr_workers = resolved["hrrr_workers"]
+    hrrr_cycle_workers = resolved["hrrr_cycle_workers"]
+
+    if start is None and profile and "lookback_days" in PROFILES[profile]:
+        start = datetime.now(tz=UTC).date() - timedelta(days=PROFILES[profile]["lookback_days"])
+
     resolved_start = start or airport.history_start or date(2020, 1, 1)
     resolved_end = end or datetime.now(tz=UTC).date()
     log_path = ctx.obj.get("log_path", "")
     skip_existing = not no_skip_existing
+
+    if profile:
+        click.echo(
+            f"profile={profile}: range={resolved_start}→{resolved_end} "
+            f"step={step_hours}h leads={lead_min}-{lead_max} "
+            f"workers metar={metar_workers} hrrr={hrrr_workers}×{hrrr_cycle_workers}",
+            err=True,
+        )
 
     _run_ingest_metar(
         airport,
@@ -491,7 +578,7 @@ def run_cmd(
         end=datetime.combine(resolved_end, datetime.min.time(), tzinfo=UTC),
         lead_min=lead_min,
         lead_max=lead_max,
-        step_hours=1,
+        step_hours=step_hours,
         grid_half=2,
         workers=hrrr_workers,
         cycle_workers=hrrr_cycle_workers,
