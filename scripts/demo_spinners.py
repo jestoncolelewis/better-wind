@@ -28,6 +28,17 @@ PHASES = [
     ("scoring climatology", 0.4),
 ]
 
+# Plausible per-phase results so the ribbon demo can show real-looking stats.
+PHASE_RESULTS = {
+    "loading HRRR forecasts": "12,453 rows",
+    "loading METAR observations": "8,231 obs",
+    "pairing forecasts to obs": "7,892 paired",
+    "chronological split": "train=5523 val=1183 test=1186",
+    "scoring persistence": "RMSE 4.21 kt",
+    "scoring hrrr": "RMSE 3.87 kt",
+    "scoring climatology": "RMSE 3.95 kt",
+}
+
 
 # ─── Option A: tqdm indeterminate ────────────────────────────────────────────
 # Matches the existing ingest commands. Looks the same as the METAR/HRRR bars.
@@ -108,27 +119,77 @@ def demo_phased_echo() -> None:
 
 
 # ─── Option F: rich Live ribbon banner ───────────────────────────────────────
-# Full-width panel pinned at the bottom. Most "app-like", a bit heavy for a CLI.
+# Full-panel "task list" — completed phases stay on screen with their result
+# and timing, the active phase shows a live spinner, and a progress bar +
+# elapsed clock pin to the top. Closer to `terraform plan` / `vercel deploy`.
 def demo_ribbon() -> None:
-    from rich.console import Console
+    from rich.console import Console, Group
     from rich.live import Live
     from rich.panel import Panel
+    from rich.progress import BarColumn, Progress, TextColumn
     from rich.spinner import Spinner
     from rich.table import Table
+    from rich.text import Text
 
     console = Console()
 
-    def render(phase: str, done: int) -> Panel:
-        t = Table.grid(padding=(0, 1))
-        t.add_row(Spinner("dots", style="cyan"), f"[bold]eval KMAN[/] · {phase}")
-        t.add_row("", f"[dim]{done}/{len(PHASES)} steps[/]")
-        return Panel(t, border_style="cyan", title="wind-forecast", title_align="left")
+    progress = Progress(
+        TextColumn("[bold cyan]eval KMAN"),
+        BarColumn(bar_width=40),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        TextColumn("· step {task.completed}/{task.total}"),
+        TextColumn("· [dim]elapsed[/] {task.fields[elapsed]}"),
+    )
+    task_id = progress.add_task("eval", total=len(PHASES), elapsed="0.0s")
 
-    with Live(render("starting", 0), console=console, refresh_per_second=12) as live:
-        for i, (label, dur) in enumerate(PHASES, 1):
-            live.update(render(label, i - 1))
+    completed: list[tuple[str, str, float]] = []  # (label, result, secs)
+    started = time.monotonic()
+
+    def render(active: str | None) -> Panel:
+        rows = Table.grid(padding=(0, 1), expand=True)
+        rows.add_column(width=2)        # status glyph
+        rows.add_column(ratio=2)        # phase label
+        rows.add_column(ratio=2)        # result
+        rows.add_column(justify="right")  # timing
+
+        for label, result, secs in completed:
+            rows.add_row(
+                Text("✓", style="green"),
+                Text(label),
+                Text(result, style="dim"),
+                Text(f"{secs:.1f}s", style="dim"),
+            )
+        if active is not None:
+            rows.add_row(
+                Spinner("dots", style="cyan"),
+                Text(active, style="bold"),
+                Text("…", style="dim"),
+                Text(""),
+            )
+
+        body = Group(progress, Text(""), rows)
+        return Panel(
+            body,
+            border_style="cyan",
+            title="[bold]wind-forecast[/]",
+            title_align="left",
+            subtitle=f"[dim]{len(completed)}/{len(PHASES)} done[/]",
+            subtitle_align="right",
+        )
+
+    with Live(render(PHASES[0][0]), console=console, refresh_per_second=12) as live:
+        for label, dur in PHASES:
+            phase_start = time.monotonic()
+            live.update(render(label))
             time.sleep(dur)
-        live.update(render("done", len(PHASES)))
+            completed.append((label, PHASE_RESULTS[label], time.monotonic() - phase_start))
+            progress.update(
+                task_id,
+                advance=1,
+                elapsed=f"{time.monotonic() - started:.1f}s",
+            )
+            live.update(render(None))
+        live.update(render(None))
 
 
 DEMOS = {
