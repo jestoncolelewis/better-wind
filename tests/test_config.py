@@ -79,7 +79,7 @@ def test_rejects_bad_heading(tmp_path: Path) -> None:
 
 def test_history_start_parses_as_date() -> None:
     a = Airport.load("KMAN", CONFIG_DIR)
-    assert a.history_start == date(2015, 1, 1)
+    assert a.history_start == date(2020, 1, 1)
 
 
 def test_rejects_extra_fields(tmp_path: Path) -> None:
