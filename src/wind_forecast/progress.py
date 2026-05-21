@@ -82,17 +82,19 @@ class JobRibbon:
     # ── context manager ─────────────────────────────────────────────────────
     def __enter__(self) -> JobRibbon:
         self._console = Console(stderr=True)
+        # `task.elapsed` is recomputed each render, so the elapsed counter
+        # ticks at the Live refresh rate without us having to push updates.
         self._progress = Progress(
             TextColumn(f"[bold cyan]{self.title}"),
             BarColumn(bar_width=40),
             TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
             TextColumn("· step {task.completed}/{task.total}"),
-            TextColumn("· [dim]elapsed[/] {task.fields[elapsed]}"),
+            TextColumn("· [dim]elapsed[/] {task.elapsed:.1f}s"),
             TextColumn("· [dim]eta[/] {task.fields[eta]}"),
             console=self._console,
         )
         self._task_id = self._progress.add_task(
-            "job", total=len(self.all_phases), elapsed="0.0s", eta="—",
+            "job", total=len(self.all_phases), eta="—",
         )
         self._started = time.monotonic()
 
@@ -142,18 +144,16 @@ class JobRibbon:
         ))
         self._active = None
 
-        elapsed = time.monotonic() - self._started
         done = len(self._completed)
         if done < len(self.all_phases) and done > 0:
+            elapsed = time.monotonic() - self._started
             avg = elapsed / done
             remaining = avg * (len(self.all_phases) - done)
             eta = f"~{remaining:.1f}s"
         else:
             eta = "—"
         if self._progress is not None and self._task_id is not None:
-            self._progress.update(
-                self._task_id, advance=1, elapsed=f"{elapsed:.1f}s", eta=eta,
-            )
+            self._progress.update(self._task_id, advance=1, eta=eta)
         self._refresh()
 
     def sub_progress(
