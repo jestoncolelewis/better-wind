@@ -23,6 +23,7 @@ dependencies = [
     "pyarrow>=15.0",
     "numpy>=1.26",
     "tqdm>=4.66",
+    "rich>=13.7",
 ]
 
 [project.scripts]
@@ -35,12 +36,6 @@ dev = [
     "mypy>=1.9",
     "ipykernel>=6.29",
     "matplotlib>=3.8",
-]
-# Exploratory deps used only by `scripts/demo_spinners.py`. Removed once a
-# progress-indicator style is picked and wired into the CLI.
-demo = [
-    "rich>=13.7",
-    "yaspin>=3.0",
 ]
 
 [build-system]

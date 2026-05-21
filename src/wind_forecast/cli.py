@@ -79,6 +79,7 @@ def cli(ctx: click.Context, verbose: int, log_file: Path | None) -> None:
     log_path = setup_logging(verbose=verbose, log_file=log_file)
     click.echo(f"logging to {log_path}", err=True)
     ctx.ensure_object(dict)
+    ctx.obj["log_path"] = log_path
 
 
 @cli.command("list-airports")
@@ -227,7 +228,9 @@ def ingest_hrrr_cmd(
 )
 @config_dir_option
 @data_root_option
+@click.pass_context
 def eval_cmd(
+    ctx: click.Context,
     airport_icao: str,
     baseline_choice: str,
     by_lead: bool,
@@ -239,16 +242,27 @@ def eval_cmd(
     """Score deterministic baselines (persistence / HRRR / climatology) on the test split."""
     from wind_forecast.eval import baselines as bl  # deferred
     from wind_forecast.eval.harness import evaluate_airport, format_table
+    from wind_forecast.eval.progress import maybe_ribbon
 
     airport = Airport.load(airport_icao, config_dir)
-    names = bl.ALL_BASELINES if baseline_choice == "all" else (baseline_choice,)
-    metrics = evaluate_airport(
-        airport,
-        data_root=data_root,
-        baselines=names,
-        train_frac=train_frac,
-        val_frac=val_frac,
-    )
+    names = list(bl.ALL_BASELINES if baseline_choice == "all" else (baseline_choice,))
+
+    with maybe_ribbon(
+        airport_icao=airport.icao,
+        baseline_names=names,
+        log_path=ctx.obj.get("log_path", ""),
+    ) as ribbon:
+        metrics = evaluate_airport(
+            airport,
+            data_root=data_root,
+            baselines=names,
+            train_frac=train_frac,
+            val_frac=val_frac,
+            on_phase_start=ribbon.begin if ribbon else None,
+            on_phase_done=ribbon.end_phase if ribbon else None,
+            on_load_progress=ribbon.sub_progress if ribbon else None,
+        )
+
     click.echo(format_table(metrics, by_lead=by_lead))
 
 
