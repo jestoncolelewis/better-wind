@@ -119,7 +119,7 @@ class JobRibbon:
             TextColumn(f"[bold cyan]{self.title}"),
             BarColumn(bar_width=40),
             TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-            TextColumn("· step {task.completed}/{task.total}"),
+            _DynamicTextColumn(self._compute_step_text),
             _DynamicTextColumn(self._compute_elapsed),
             _DynamicTextColumn(self._compute_eta),
             console=self._console,
@@ -155,6 +155,7 @@ class JobRibbon:
         self._sub_done = 0
         self._sub_total = 0
         self._sub_summary = ""
+        self._sync_task_progress()
         self._refresh()
 
     def end_phase(self, phase: str, info: dict[str, Any]) -> None:
@@ -172,9 +173,22 @@ class JobRibbon:
         ))
         self._active = None
 
-        if self._progress is not None and self._task_id is not None:
-            self._progress.update(self._task_id, advance=1)
+        self._sync_task_progress()
         self._refresh()
+
+    def _sync_task_progress(self) -> None:
+        """Push a fractional `completed` to the Progress task so the bar +
+        percentage reflect both finished phases and sub-progress within the
+        current phase."""
+        if self._progress is None or self._task_id is None:
+            return
+        progress = float(len(self._completed))
+        if self._active and self._sub_total > 0 and self._sub_done > 0:
+            progress += min(1.0, self._sub_done / self._sub_total)
+        self._progress.update(self._task_id, completed=progress)
+
+    def _compute_step_text(self) -> str:
+        return f"· step {len(self._completed)}/{len(self.all_phases)}"
 
     def _compute_elapsed(self) -> str:
         elapsed = time.monotonic() - self._started
@@ -217,6 +231,7 @@ class JobRibbon:
         self._sub_done = done
         self._sub_total = total
         self._sub_summary = summary
+        self._sync_task_progress()
         self._refresh()
 
     # ── hooks for subclasses ────────────────────────────────────────────────
