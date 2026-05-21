@@ -8,8 +8,9 @@ here mutates `data/`.
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -25,6 +26,12 @@ DEFAULT_TRAIN_FRAC = 0.70
 DEFAULT_VAL_FRAC = 0.15
 
 OVERALL_LEAD = "all"
+
+# Phase callbacks let the CLI render a live progress UI. evaluate_airport
+# stays usable without them — pass nothing and the run is silent (which is
+# what tests do).
+PhaseStart = Callable[[str], None]
+PhaseDone = Callable[[str, dict[str, Any]], None]
 
 
 def chronological_split(
@@ -105,25 +112,74 @@ def evaluate_airport(
     train_frac: float = DEFAULT_TRAIN_FRAC,
     val_frac: float = DEFAULT_VAL_FRAC,
     paired: pd.DataFrame | None = None,
+    on_phase_start: PhaseStart | None = None,
+    on_phase_done: PhaseDone | None = None,
+    on_load_progress: eio.LoadProgress | None = None,
 ) -> pd.DataFrame:
     """Run the requested baselines for one airport, return a tidy metrics frame.
 
     `paired` is exposed for tests; production code passes `None` and we load
-    from `data_root`.
+    from `data_root`. The `on_phase_*` and `on_load_progress` callbacks let
+    the CLI render a live progress panel — they default to no-ops.
     """
+    def _start(name: str) -> None:
+        if on_phase_start is not None:
+            on_phase_start(name)
+
+    def _done(name: str, **info: Any) -> None:
+        if on_phase_done is not None:
+            on_phase_done(name, info)
+
     if paired is None:
-        paired = eio.load_and_pair(airport, data_root=data_root)
+        _start("loading HRRR forecasts")
+        fcst = eio.load_hrrr_forecasts(
+            airport, data_root=data_root, on_progress=on_load_progress,
+        )
+        fcst = eio.nearest_grid_point(fcst, airport.latitude, airport.longitude)
+        _done(
+            "loading HRRR forecasts",
+            rows=len(fcst),
+            cycles=int(fcst["cycle_utc"].nunique()) if not fcst.empty else 0,
+        )
+
+        _start("loading METAR observations")
+        obs = eio.load_metar_obs(airport, data_root=data_root)
+        _done("loading METAR observations", obs=len(obs))
+
+        _start("pairing forecasts to obs")
+        paired = eio.pair_obs_to_forecasts(fcst, obs)
+        _done("pairing forecasts to obs", paired=len(paired))
+
     if paired.empty:
         raise RuntimeError(f"no paired (HRRR, obs) rows for {airport.icao}")
 
+    _start("chronological split")
     train, _val, test = chronological_split(paired, train_frac=train_frac, val_frac=val_frac)
     if test.empty:
         raise RuntimeError(f"empty test split for {airport.icao}")
+    _done(
+        "chronological split",
+        train=len(train), val=len(_val), test=len(test),
+    )
 
     rows: list[em.MetricRow] = []
     for name in baselines:
+        _start(f"scoring {name}")
         pred = bl.predict(name, train, test)
-        rows.extend(_metrics_for(name, test, pred))
+        baseline_rows = _metrics_for(name, test, pred)
+        overall = next(
+            (r for r in baseline_rows if r["lead_hour"] == OVERALL_LEAD),
+            None,
+        )
+        rmse: float | None = None
+        n: int = 0
+        if overall is not None:
+            rmse_val = overall.get("rmse_speed")
+            n_val = overall.get("n")
+            rmse = float(rmse_val) if rmse_val is not None and not pd.isna(rmse_val) else None
+            n = int(n_val) if n_val is not None else 0
+        _done(f"scoring {name}", rmse=rmse, n=n)
+        rows.extend(baseline_rows)
 
     df = pd.DataFrame(rows)
     df.insert(0, "airport", airport.icao)

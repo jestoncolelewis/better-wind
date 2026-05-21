@@ -8,12 +8,15 @@ the obs at the cycle init time (persistence baseline).
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 from wind_forecast.config import DEFAULT_DATA_ROOT, Airport
+
+LoadProgress = Callable[[int, int], None]
 
 logger = logging.getLogger(__name__)
 
@@ -40,16 +43,29 @@ def load_metar_obs(
 
 
 def load_hrrr_forecasts(
-    airport: Airport, *, data_root: Path = DEFAULT_DATA_ROOT
+    airport: Airport,
+    *,
+    data_root: Path = DEFAULT_DATA_ROOT,
+    on_progress: LoadProgress | None = None,
 ) -> pd.DataFrame:
-    """Concatenate every per-cycle HRRR Parquet under the airport's raw dir."""
+    """Concatenate every per-cycle HRRR Parquet under the airport's raw dir.
+
+    `on_progress(done, total)` is called after each file is read, if provided.
+    Used by the CLI ribbon to show sub-progress during the slowest phase.
+    """
     root = airport.raw_hrrr_dir(data_root)
     files = sorted(root.rglob("*.parquet"))
     if not files:
         raise FileNotFoundError(
             f"No HRRR Parquets under {root}. Run `wind-forecast ingest-hrrr` first."
         )
-    frames = [pd.read_parquet(f) for f in files]
+    if on_progress is not None:
+        on_progress(0, len(files))
+    frames: list[pd.DataFrame] = []
+    for i, f in enumerate(files, 1):
+        frames.append(pd.read_parquet(f))
+        if on_progress is not None:
+            on_progress(i, len(files))
     df = pd.concat(frames, ignore_index=True)
     # PyArrow writes tz-aware Python datetimes at us precision; METAR ingest
     # pins ns. Normalize both so merge_asof can join them.
