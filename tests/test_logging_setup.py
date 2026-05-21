@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import logging
+import warnings
 from pathlib import Path
+
+import pytest
 
 from wind_forecast.logging_setup import default_log_path, setup_logging
 
@@ -87,3 +90,34 @@ def test_noisy_libraries_pinned_to_warning_below_vvv(tmp_path: Path) -> None:
     for h in list(logging.getLogger().handlers):
         logging.getLogger().removeHandler(h)
         h.close()
+
+
+def test_warnings_routed_to_file_not_console(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`warnings.warn(...)` should land in the log file but not on stderr.
+
+    Library warnings (e.g. herbie's "Will not remove GRIB file...") use
+    Python's `warnings` module, which bypasses logging by default. With
+    `logging.captureWarnings(True)` they go through `py.warnings`; a console
+    filter then keeps them off stderr while the file handler records them.
+    """
+    log_file = tmp_path / "w.log"
+    setup_logging(verbose=0, log_file=log_file)
+    try:
+        # Make sure this specific warning isn't suppressed by Python's
+        # once-per-location filter (some other test may have triggered it).
+        warnings.simplefilter("always")
+        warnings.warn("herbie-like grib warning xyz123", UserWarning, stacklevel=1)
+
+        for h in logging.getLogger().handlers:
+            h.flush()
+
+        captured = capsys.readouterr()
+        assert "herbie-like grib warning xyz123" not in captured.err
+        assert "herbie-like grib warning xyz123" in log_file.read_text()
+    finally:
+        for h in list(logging.getLogger().handlers):
+            logging.getLogger().removeHandler(h)
+            h.close()
+        warnings.resetwarnings()

@@ -2,7 +2,9 @@
 
 Console is intentionally quiet by default — the user sees a tqdm progress bar
 and warnings/errors, nothing more. The log file (always on) captures the full
-DEBUG stream for our own code (`wind_forecast.*`).
+DEBUG stream for our own code (`wind_forecast.*`) plus any `warnings.warn(...)`
+that escapes from third-party libraries (herbie, cfgrib, etc.) — those would
+otherwise bypass logging and clog stderr.
 """
 
 from __future__ import annotations
@@ -10,9 +12,11 @@ from __future__ import annotations
 import contextlib
 import logging
 import sys
+import warnings
 from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 DEFAULT_LOG_DIR = Path("logs")
 _FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
@@ -59,6 +63,30 @@ def _noisy_library_level(verbose: int) -> int:
     return logging.DEBUG if verbose >= 3 else logging.WARNING
 
 
+def _drop_console_warnings(record: logging.LogRecord) -> bool:
+    """Console filter: keep `py.warnings` records out of stderr (file only)."""
+    return not record.name.startswith("py.warnings")
+
+
+def _showwarning_to_log(
+    message: Warning | str,
+    category: type[Warning],
+    filename: str,
+    lineno: int,
+    file: Any = None,
+    line: str | None = None,
+) -> None:
+    """Route `warnings.warn(...)` through the `py.warnings` logger.
+
+    Installed directly instead of via `logging.captureWarnings` because that
+    function caches the prior `showwarning` in a module global and becomes
+    a silent no-op on the second call (e.g. across pytest tests).
+    """
+    del file  # always send through logging, ignore user-requested stream
+    formatted = warnings.formatwarning(message, category, filename, lineno, line)
+    logging.getLogger("py.warnings").warning("%s", formatted.rstrip())
+
+
 def setup_logging(*, verbose: int = 0, log_file: Path | None = None) -> Path:
     """Configure the root logger and return the resolved log file path.
 
@@ -66,7 +94,14 @@ def setup_logging(*, verbose: int = 0, log_file: Path | None = None) -> Path:
     terminal). `-v` raises it to INFO, `-vv` to DEBUG for our own code while
     keeping noisy third-party libraries silent, and `-vvv` lets the libraries
     through too. The file handler is always DEBUG.
+
+    `warnings.warn(...)` is also routed through the logging system so
+    library warnings — e.g. herbie's "Will not remove GRIB file..." — land
+    in the log file instead of bare stderr. A console-side filter keeps
+    them off the terminal at every verbosity (tail the log to watch them).
     """
+    warnings.showwarning = _showwarning_to_log
+
     root = logging.getLogger()
     for h in list(root.handlers):
         root.removeHandler(h)
@@ -77,6 +112,7 @@ def setup_logging(*, verbose: int = 0, log_file: Path | None = None) -> Path:
     console = logging.StreamHandler(stream=sys.stderr)
     console.setLevel(_console_level(verbose))
     console.setFormatter(formatter)
+    console.addFilter(_drop_console_warnings)
     root.addHandler(console)
 
     log_path = log_file or default_log_path()
@@ -89,6 +125,10 @@ def setup_logging(*, verbose: int = 0, log_file: Path | None = None) -> Path:
     lib_level = _noisy_library_level(verbose)
     for name in NOISY_LIBRARIES:
         logging.getLogger(name).setLevel(lib_level)
+
+    # Records from captured warnings land on this logger; WARNING level lets
+    # them through to both handlers (console filter then drops them).
+    logging.getLogger("py.warnings").setLevel(logging.WARNING)
 
     logging.getLogger("wind_forecast").debug("logging initialized -> %s", log_path)
     return log_path
