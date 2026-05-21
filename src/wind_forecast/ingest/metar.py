@@ -13,10 +13,11 @@ import io
 import logging
 import threading
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -24,6 +25,8 @@ import requests
 
 from wind_forecast.config import DEFAULT_DATA_ROOT, Airport
 from wind_forecast.winds import dir_speed_to_uv
+
+ProgressCallback = Callable[[int, int, dict[str, Any]], None]
 
 logger = logging.getLogger(__name__)
 
@@ -256,12 +259,18 @@ def ingest_airport(
     chunk_days: int = DEFAULT_CHUNK_DAYS,
     max_workers: int = DEFAULT_WORKERS,
     skip_existing: bool = True,
+    on_progress: ProgressCallback | None = None,
 ) -> dict[str, Path]:
     """Ingest the target airport and every neighbor station.
 
     Each station's date range is split into ~yearly chunks, and all
     (station, chunk) pairs run in a shared `ThreadPoolExecutor`. Existing
     Parquet files are skipped unless `skip_existing=False`.
+
+    `on_progress(done, total, counters)` is called once before any work starts
+    and again after each chunk completes. `counters` carries running totals
+    (`rows`, `failed`, plus a static `stations` count) so the CLI can render
+    a live summary.
     """
     resolved_start = start or airport.history_start or DEFAULT_HISTORY_START
     resolved_end = end or datetime.now(tz=timezone.utc).date()
@@ -285,6 +294,8 @@ def ingest_airport(
         logger.info("METAR skip-existing: %s", ", ".join(skipped))
 
     if not tasks:
+        if on_progress is not None:
+            on_progress(0, 0, {"stations": len(stations), "rows": 0, "failed": 0})
         return {s: paths[s] for s in stations if paths[s].exists()}
 
     workers = max(1, min(max_workers, len(tasks)))
@@ -293,30 +304,39 @@ def ingest_airport(
         airport.icao, len(stations) - len(skipped), len(tasks), workers, chunk_days,
     )
 
-    from tqdm.auto import tqdm
-
-    from wind_forecast.logging_setup import progress_logging
+    counters: dict[str, Any] = {
+        "stations": len(stations) - len(skipped),
+        "rows": 0,
+        "failed": 0,
+    }
+    done = 0
+    if on_progress is not None:
+        on_progress(0, len(tasks), counters)
 
     chunks_by_station: dict[str, list[pd.DataFrame]] = {s: [] for s in stations}
-    bar = tqdm(total=len(tasks), desc=f"METAR {airport.icao}", unit="chunk", dynamic_ncols=True)
-    with progress_logging(), bar, ThreadPoolExecutor(max_workers=workers) as pool:
+    with ThreadPoolExecutor(max_workers=workers) as pool:
         future_map = {
             pool.submit(_fetch_chunk, station, s, e): (station, s, e)
             for station, s, e in tasks
         }
         for fut in as_completed(future_map):
             station, s, e = future_map[fut]
+            done += 1
             try:
                 df = fut.result()
             except Exception as exc:
                 logger.warning(
                     "chunk failed station=%s [%s..%s]: %s", station, s, e, exc,
                 )
-                bar.update(1)
+                counters["failed"] += 1
+                if on_progress is not None:
+                    on_progress(done, len(tasks), counters)
                 continue
             chunks_by_station[station].append(df)
+            counters["rows"] += len(df)
             logger.info("%s %s..%s -> %d rows", station, s, e, len(df))
-            bar.update(1)
+            if on_progress is not None:
+                on_progress(done, len(tasks), counters)
 
     written: dict[str, Path] = {}
     for station, frames in chunks_by_station.items():
