@@ -469,7 +469,7 @@ def run_cmd(
     from wind_forecast.eval.harness import format_table
 
     airport = Airport.load(airport_icao, config_dir)
-    resolved_start = start or _date_from_iso(airport.history_start) or date(2020, 1, 1)
+    resolved_start = start or airport.history_start or date(2020, 1, 1)
     resolved_end = end or datetime.now(tz=UTC).date()
     log_path = ctx.obj.get("log_path", "")
     skip_existing = not no_skip_existing
@@ -515,15 +515,6 @@ def run_cmd(
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
-def _date_from_iso(value: str | None) -> date | None:
-    if value is None:
-        return None
-    try:
-        return date.fromisoformat(value)
-    except ValueError:
-        return None
-
-
 def _parquet_row_count(path: Path) -> int:
     try:
         import pyarrow.parquet as pq
