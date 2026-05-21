@@ -36,6 +36,12 @@ dev = [
     "ipykernel>=6.29",
     "matplotlib>=3.8",
 ]
+# Exploratory deps used only by `scripts/demo_spinners.py`. Removed once a
+# progress-indicator style is picked and wired into the CLI.
+demo = [
+    "rich>=13.7",
+    "yaspin>=3.0",
+]
 
 [build-system]
 requires = ["hatchling"]
