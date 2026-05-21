@@ -19,4 +19,4 @@ neighbor_stations:
   - KMUO   # Mountain Home, ~45nm SE
   - KONO   # Ontario OR,    ~45nm NW
 
-history_start: "2015-01-01"
+history_start: "2020-01-01"

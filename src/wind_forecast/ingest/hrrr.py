@@ -11,7 +11,7 @@ unit tests can import this module without pulling in the entire GRIB stack.
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -22,6 +22,8 @@ import numpy as np
 import pandas as pd
 
 from wind_forecast.config import DEFAULT_DATA_ROOT, Airport
+
+ProgressCallback = Callable[[int, int, dict[str, Any]], None]
 
 if TYPE_CHECKING:
     import xarray as xr
@@ -210,7 +212,11 @@ def _fetch_lead(
         try:
             ds = H.xarray(spec.search)
         except Exception as exc:
-            logger.warning(
+            # Per-variable failures are expected during backfills (missing
+            # GRIB on AWS, herbie subset edge cases on early cycles). Log to
+            # file at INFO; the ribbon's `failed` counter is the user-facing
+            # signal. Bump to WARNING if it ever blocks operational use.
+            logger.info(
                 "HRRR fetch failed cycle=%s lead=%d var=%s: %s",
                 cycle_aware.isoformat(), lead, spec.name, exc,
             )
@@ -292,7 +298,7 @@ def fetch_cycle(
                 try:
                     frame = fut.result()
                 except Exception as exc:
-                    logger.warning(
+                    logger.info(
                         "HRRR lead failed cycle=%s lead=%d: %s",
                         cycle.isoformat(), lead, exc,
                     )
@@ -347,7 +353,7 @@ def _process_cycle(
     )
     elapsed = (datetime.now(tz=timezone.utc) - t0).total_seconds()
     if df.empty:
-        logger.warning("no data for cycle %s", cycle.isoformat())
+        logger.info("no data for cycle %s", cycle.isoformat())
         return CycleResult(cycle, None, "empty", 0)
     path.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(path, index=False)
@@ -368,6 +374,7 @@ def ingest_airport(
     data_root: Path = DEFAULT_DATA_ROOT,
     max_workers: int = DEFAULT_WORKERS,
     cycle_workers: int = DEFAULT_CYCLE_WORKERS,
+    on_progress: ProgressCallback | None = None,
 ) -> IngestSummary:
     """Ingest HRRR for every init cycle in `[start, end)`.
 
@@ -378,15 +385,16 @@ def ingest_airport(
     Concurrency is two-tiered: `cycle_workers` cycles are fetched in parallel,
     and within each cycle `max_workers` lead hours are fetched in parallel.
     Peak in-flight lead fetches is ~`cycle_workers * max_workers`.
+
+    `on_progress(done, total, counters)` is called once before any cycle
+    runs and again after each cycle finishes. `counters` mirrors the running
+    `IngestSummary` (written / skipped / failed / empty / rows) so the CLI
+    can show a live summary.
     """
     if isinstance(start, date) and not isinstance(start, datetime):
         start = datetime(start.year, start.month, start.day, tzinfo=timezone.utc)
     if isinstance(end, date) and not isinstance(end, datetime):
         end = datetime(end.year, end.month, end.day, tzinfo=timezone.utc)
-
-    from tqdm.auto import tqdm
-
-    from wind_forecast.logging_setup import progress_logging
 
     cycles = list(iter_cycles(start, end, cycle_step_hours))
     total = len(cycles)
@@ -409,12 +417,25 @@ def ingest_airport(
         )
 
     summary = IngestSummary(total=total)
-    bar = tqdm(total=total, desc=f"HRRR {airport.icao}", unit="cycle", dynamic_ncols=True)
+    done = 0
+
+    def _counters() -> dict[str, Any]:
+        return {
+            "written": summary.written,
+            "skipped": summary.skipped,
+            "failed": summary.failed,
+            "empty": summary.empty,
+            "rows": summary.rows,
+        }
+
+    if on_progress is not None:
+        on_progress(0, total, _counters())
 
     def _record(cycle: datetime, result: CycleResult | None, exc: Exception | None) -> None:
+        nonlocal done
         if exc is not None:
             summary.failed += 1
-            logger.warning("cycle %s failed: %s", cycle.isoformat(), exc)
+            logger.info("cycle %s failed: %s", cycle.isoformat(), exc)
         else:
             assert result is not None
             if result.status == "written":
@@ -424,29 +445,29 @@ def ingest_airport(
                 summary.skipped += 1
             else:
                 summary.empty += 1
-        bar.set_postfix(summary.postfix(), refresh=False)
-        bar.update(1)
+        done += 1
+        if on_progress is not None:
+            on_progress(done, total, _counters())
 
-    with progress_logging(), bar:
-        if cycle_pool_size == 1:
-            for cycle in cycles:
+    if cycle_pool_size == 1:
+        for cycle in cycles:
+            try:
+                result = _run(cycle)
+            except Exception as exc:
+                _record(cycle, None, exc)
+                continue
+            _record(cycle, result, None)
+    else:
+        with ThreadPoolExecutor(max_workers=cycle_pool_size) as pool:
+            futures = {pool.submit(_run, c): c for c in cycles}
+            for fut in as_completed(futures):
+                cycle = futures[fut]
                 try:
-                    result = _run(cycle)
+                    result = fut.result()
                 except Exception as exc:
                     _record(cycle, None, exc)
                     continue
                 _record(cycle, result, None)
-        else:
-            with ThreadPoolExecutor(max_workers=cycle_pool_size) as pool:
-                futures = {pool.submit(_run, c): c for c in cycles}
-                for fut in as_completed(futures):
-                    cycle = futures[fut]
-                    try:
-                        result = fut.result()
-                    except Exception as exc:
-                        _record(cycle, None, exc)
-                        continue
-                    _record(cycle, result, None)
 
     logger.info(
         "HRRR ingest done: airport=%s new=%d skip=%d fail=%d empty=%d rows=%d",

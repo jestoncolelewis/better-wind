@@ -27,20 +27,34 @@ No GPU required. Everything runs on a single workstation.
 git clone https://github.com/jestoncolelewis/better-wind.git
 cd better-wind
 
-# Create a .venv and install runtime + dev deps (pytest, ruff, mypy, matplotlib)
+# Install `wind-forecast` onto your PATH. `--editable` means the install
+# tracks the source tree — `git pull` is enough to pick up new versions.
+uv tool install --editable .
+
+# One-time: tell uv to add ~/.local/bin to your shell's PATH if it isn't
+# already there.
+uv tool update-shell
+```
+
+After this, `wind-forecast --help` works from any directory. CLI commands
+still default to `./config/airports/` and `./data/` (relative paths), so
+run them from the repo root unless you pass `--config-dir` / `--data-root`.
+
+For development (tests, lint, type-check) also create the local dev venv:
+
+```bash
 uv sync --extra dev
 ```
 
-`uv` creates `.venv/` in the repo root and resolves all deps from
-`pyproject.toml`. Every command below is run through `uv run …` so you never
-have to activate the venv manually.
+That puts `pytest`, `ruff`, `mypy`, and `matplotlib` in `.venv/`. Run them
+with `uv run pytest`, `uv run ruff check src`, etc.
 
 ## Verify it's working
 
 1. **List configured airports.** Proves the config loader and `--airport`
    plumbing work end-to-end.
    ```bash
-   uv run wind-forecast list-airports
+   wind-forecast list-airports
    ```
    Expected output:
    ```
@@ -49,7 +63,7 @@ have to activate the venv manually.
    KMAN  Nampa Municipal Airport  (43.5817, -116.5225)
    ```
 
-2. **Run the test suite.** 62 tests; should pass in under a second. Covers
+2. **Run the test suite.** 67 tests; should pass in under a second. Covers
    config validation, METAR schema stability across stations, wind u/v
    round-trips, cycle iteration, path partitioning, date chunking, logging
    setup, plus the Phase 2 eval harness (HRRR↔obs pairing, baselines, and
@@ -60,16 +74,39 @@ have to activate the venv manually.
 
 3. **See the CLI surface.**
    ```bash
-   uv run wind-forecast --help
-   uv run wind-forecast ingest-metar --help
-   uv run wind-forecast ingest-hrrr  --help
-   uv run wind-forecast eval         --help
+   wind-forecast --help
+   wind-forecast run          --help
+   wind-forecast ingest-metar --help
+   wind-forecast ingest-hrrr  --help
+   wind-forecast eval         --help
    ```
+
+## Run the whole pipeline in one shot
+
+```bash
+wind-forecast run --airport KMAN
+```
+
+`run` is the easy button: it ingests METAR, ingests HRRR, then scores the
+baselines, all for one airport. Date range defaults to `history_start` from
+the YAML through "today UTC". A live ribbon panel reports each phase as
+it goes; the final eval table prints at the end.
+
+Common variations:
+
+```bash
+wind-forecast run --airport KMAN --start 2024-01-01 --end 2024-02-01
+wind-forecast run --airport KMAN --no-eval                  # ingest only
+wind-forecast run --airport KMAN --by-lead                  # detailed eval table
+```
+
+The individual commands below give you finer control if you only need one
+piece of the pipeline (e.g. re-running just the eval after a config tweak).
 
 ## Pull METAR observations (ground truth)
 
 ```bash
-uv run wind-forecast ingest-metar --airport KMAN
+wind-forecast ingest-metar --airport KMAN
 ```
 
 This hits the Iowa Mesonet ASOS endpoint for every station (`KMAN` plus every
@@ -93,7 +130,7 @@ chunk keeps timing out, shrink it: `--chunk-days 180`.
 ## Pull HRRR forecasts (predictors + baseline)
 
 ```bash
-uv run wind-forecast ingest-hrrr \
+wind-forecast ingest-hrrr \
     --airport KMAN \
     --start 2024-01-01T00:00Z \
     --end   2024-01-08T00:00Z
@@ -147,20 +184,27 @@ concurrency setting.
 
 ## Logging & progress
 
-Every CLI invocation:
+Every long-running CLI command renders a **live ribbon panel** to stderr:
+completed phases stay visible with their result + timing, the active phase
+shows a spinner with sub-progress (cycles, chunks, files), pending phases
+are listed dim, and `eval` adds a ranking row sorting baselines by RMSE
+once they've all scored. Each command's footer carries the log file path,
+RSS, and pid.
 
-- Prints **only a progress bar plus warnings/errors** to the console. Per-task
-  detail (chunk row counts, retry attempts, cycle timings) goes to a file.
-- Writes a **full DEBUG log** to `logs/wind-forecast-<UTCtimestamp>Z.log`.
-  This is the source of truth when something goes wrong — open it in another
-  terminal with `tail -f logs/wind-forecast-*.log`.
+Non-interactive runs (CI, redirected stderr) skip the ribbon entirely so
+your build logs stay clean.
+
+Independent of the panel, every invocation writes a **full DEBUG log** to
+`logs/wind-forecast-<UTCtimestamp>Z.log`. That's the source of truth when
+something goes wrong — open it in another terminal with `tail -f
+logs/wind-forecast-*.log`.
 
 Common controls (all on the top-level command, before the subcommand):
 
 ```bash
-uv run wind-forecast -v   ingest-metar --airport KMAN          # console: INFO
-uv run wind-forecast -vv  ingest-hrrr  --airport KMAN ...      # console: DEBUG
-uv run wind-forecast --log-file run.log ingest-metar --airport KMAN
+wind-forecast -v   ingest-metar --airport KMAN          # console: INFO
+wind-forecast -vv  ingest-hrrr  --airport KMAN ...      # console: DEBUG
+wind-forecast --log-file run.log ingest-metar --airport KMAN
 ```
 
 The `logs/` directory is gitignored.
@@ -173,8 +217,8 @@ uv run python -c "import pandas as pd; print(pd.read_parquet('data/raw/metar/KMA
 uv run python -c "import pandas as pd; print(pd.read_parquet('data/raw/hrrr/KMAN/2024/20240101_00Z.parquet').head())"
 ```
 
-`uv run python` uses the project venv where pandas/pyarrow are installed —
-plain `python3` from your shell won't have them.
+`uv run python` uses the local `.venv/` (from `uv sync`) where pandas and
+pyarrow live — plain `python3` from your shell won't have them.
 
 Canonical METAR schema (every station, every airport — this is the Phase 1
 acceptance criterion):
@@ -200,9 +244,9 @@ No code changes. Drop a YAML file under `config/airports/<ICAO>.yaml` (use
 `KMAN.yaml` or `KBOI.yaml` as a template), then:
 
 ```bash
-uv run wind-forecast list-airports               # new airport appears
-uv run wind-forecast ingest-metar --airport KSUN
-uv run wind-forecast ingest-hrrr  --airport KSUN --start 2024-01-01T00:00Z --end 2024-01-08T00:00Z
+wind-forecast list-airports               # new airport appears
+wind-forecast ingest-metar --airport KSUN
+wind-forecast ingest-hrrr  --airport KSUN --start 2024-01-01T00:00Z --end 2024-01-08T00:00Z
 ```
 
 Required YAML fields: `icao`, `name`, `latitude`, `longitude`, `elevation_ft`,
@@ -216,9 +260,9 @@ Once you've ingested both METAR and HRRR for an airport, score the baselines
 on a chronological 70/15/15 train/val/test split:
 
 ```bash
-uv run wind-forecast eval --airport KMAN                 # overall summary
-uv run wind-forecast eval --airport KMAN --by-lead       # one row per forecast hour
-uv run wind-forecast eval --airport KMAN --baseline climatology
+wind-forecast eval --airport KMAN                 # overall summary
+wind-forecast eval --airport KMAN --by-lead       # one row per forecast hour
+wind-forecast eval --airport KMAN --baseline climatology
 ```
 
 Three baselines run by default:
@@ -259,6 +303,7 @@ better-wind/
 │   ├── config.py               # Airport pydantic model + loader
 │   ├── winds.py                # (u, v) <-> (direction-from, speed)
 │   ├── logging_setup.py        # console + file logging, used by every CLI command
+│   ├── progress.py             # rich ribbon panels for ingest + eval (shared)
 │   ├── cli.py                  # `wind-forecast` click entry points
 │   ├── ingest/
 │   │   ├── metar.py            # Iowa Mesonet bulk downloader (chunked + parallel)
@@ -275,7 +320,7 @@ better-wind/
 ├── logs/                       # gitignored; one log file per CLI invocation
 ├── notebooks/
 │   └── 01_data_eda.ipynb       # wind rose, diurnal cycle, HRRR bias stub
-└── tests/                      # 62 tests covering config, schema, winds, chunks, logging, eval
+└── tests/                      # 67 tests covering config, schema, winds, chunks, logging, eval
 ```
 
 ## Developer loop
