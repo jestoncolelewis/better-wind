@@ -30,12 +30,42 @@ from rich.console import Console, Group
 from rich.live import Live
 from rich.logging import RichHandler
 from rich.panel import Panel
-from rich.progress import BarColumn, Progress, TaskID, TextColumn
+from rich.progress import BarColumn, Progress, ProgressColumn, TaskID, TextColumn
 from rich.spinner import Spinner
 from rich.table import Table
 from rich.text import Text
 
 _SPARK = "▁▂▃▄▅▆▇█"
+
+
+class _DynamicTextColumn(ProgressColumn):
+    """Column whose markup is computed by a callable on each render — lets
+    counters tick at Live's refresh rate without push updates."""
+
+    def __init__(self, compute: Callable[[], str]) -> None:
+        super().__init__()
+        self._compute = compute
+
+    def render(self, task: Any) -> Text:
+        del task
+        return Text.from_markup(self._compute())
+
+
+def _fmt_duration(secs: float) -> str:
+    """Compact human-readable duration. Top two units, e.g. `2d07h`, `1h05m`."""
+    if secs < 0:
+        secs = 0
+    if secs < 60:
+        return f"{secs:.1f}s"
+    s = int(round(secs))
+    m, s = divmod(s, 60)
+    if m < 60:
+        return f"{m}m{s:02d}s"
+    h, m = divmod(m, 60)
+    if h < 24:
+        return f"{h}h{m:02d}m"
+    d, h = divmod(h, 24)
+    return f"{d}d{h:02d}h"
 
 
 @dataclass
@@ -82,19 +112,19 @@ class JobRibbon:
     # ── context manager ─────────────────────────────────────────────────────
     def __enter__(self) -> JobRibbon:
         self._console = Console(stderr=True)
+        self._started = time.monotonic()
+        # Dynamic columns are evaluated each render, so the counters tick at
+        # Live's refresh rate without us having to push updates.
         self._progress = Progress(
             TextColumn(f"[bold cyan]{self.title}"),
             BarColumn(bar_width=40),
             TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-            TextColumn("· step {task.completed}/{task.total}"),
-            TextColumn("· [dim]elapsed[/] {task.fields[elapsed]}"),
-            TextColumn("· [dim]eta[/] {task.fields[eta]}"),
+            _DynamicTextColumn(self._compute_step_text),
+            _DynamicTextColumn(self._compute_elapsed),
+            _DynamicTextColumn(self._compute_eta),
             console=self._console,
         )
-        self._task_id = self._progress.add_task(
-            "job", total=len(self.all_phases), elapsed="0.0s", eta="—",
-        )
-        self._started = time.monotonic()
+        self._task_id = self._progress.add_task("job", total=len(self.all_phases))
 
         # Route logs through rich so warnings don't tear the live region.
         self._log_redirect = rich_progress_logging(self._console)
@@ -125,6 +155,7 @@ class JobRibbon:
         self._sub_done = 0
         self._sub_total = 0
         self._sub_summary = ""
+        self._sync_task_progress()
         self._refresh()
 
     def end_phase(self, phase: str, info: dict[str, Any]) -> None:
@@ -142,19 +173,52 @@ class JobRibbon:
         ))
         self._active = None
 
-        elapsed = time.monotonic() - self._started
-        done = len(self._completed)
-        if done < len(self.all_phases) and done > 0:
-            avg = elapsed / done
-            remaining = avg * (len(self.all_phases) - done)
-            eta = f"~{remaining:.1f}s"
-        else:
-            eta = "—"
-        if self._progress is not None and self._task_id is not None:
-            self._progress.update(
-                self._task_id, advance=1, elapsed=f"{elapsed:.1f}s", eta=eta,
-            )
+        self._sync_task_progress()
         self._refresh()
+
+    def _sync_task_progress(self) -> None:
+        """Push a fractional `completed` to the Progress task so the bar +
+        percentage reflect both finished phases and sub-progress within the
+        current phase."""
+        if self._progress is None or self._task_id is None:
+            return
+        progress = float(len(self._completed))
+        if self._active and self._sub_total > 0 and self._sub_done > 0:
+            progress += min(1.0, self._sub_done / self._sub_total)
+        self._progress.update(self._task_id, completed=progress)
+
+    def _compute_step_text(self) -> str:
+        return f"· step {len(self._completed)}/{len(self.all_phases)}"
+
+    def _compute_elapsed(self) -> str:
+        elapsed = time.monotonic() - self._started
+        return f"· [dim]elapsed[/] {_fmt_duration(elapsed)}"
+
+    def _compute_eta(self) -> str:
+        """Best-effort ETA, recomputed on every render.
+
+        Within an active phase with sub-progress data, extrapolates from the
+        observed rate. Otherwise falls back to average completed-phase
+        duration × remaining phases.
+        """
+        remaining: float | None = None
+        if self._active and self._sub_total > 0 and self._sub_done > 0:
+            active_elapsed = time.monotonic() - self._active_start
+            if active_elapsed > 0:
+                rate = self._sub_done / active_elapsed
+                if rate > 0:
+                    remaining = (self._sub_total - self._sub_done) / rate
+
+        if remaining is None:
+            done = len(self._completed)
+            if 0 < done < len(self.all_phases):
+                elapsed = time.monotonic() - self._started
+                avg = elapsed / done
+                remaining = avg * (len(self.all_phases) - done)
+
+        if remaining is None:
+            return "· [dim]eta[/] —"
+        return f"· [dim]eta[/] ~{_fmt_duration(remaining)}"
 
     def sub_progress(
         self,
@@ -167,6 +231,7 @@ class JobRibbon:
         self._sub_done = done
         self._sub_total = total
         self._sub_summary = summary
+        self._sync_task_progress()
         self._refresh()
 
     # ── hooks for subclasses ────────────────────────────────────────────────
